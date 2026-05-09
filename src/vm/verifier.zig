@@ -5,6 +5,7 @@ const frame = @import("frame.zig");
 const Function = frame.Function;
 const types = @import("types.zig");
 const TypeTag = types.TypeTag;
+const module_mod = @import("module.zig");
 
 pub const VerifierError = error{
     StackUnderflow,
@@ -54,14 +55,19 @@ fn instructionStackEffect(inst: Instruction, func: *const Function, functions: [
             if (func.function_handles.len > 0) {
                 if (call.func >= func.function_handles.len) return error.InvalidFunctionIndex;
                 const handle = func.function_handles[call.func];
+                const resolved = if (call.func < func.resolved_handles.len) func.resolved_handles[call.func] else null;
                 const pop: i32 = if (handle.param_types.len > 0)
                     @intCast(handle.param_types.len)
+                else if (resolved) |r|
+                    @intCast(r.param_count)
                 else if (call.func < functions.len)
                     @intCast(functions[call.func].param_count)
                 else
                     0;
                 const push: i32 = if (handle.return_types.len > 0)
                     @intCast(handle.return_types.len)
+                else if (resolved) |r|
+                    @intCast(r.return_count)
                 else if (call.func < functions.len)
                     @intCast(functions[call.func].return_count)
                 else
@@ -77,7 +83,11 @@ fn instructionStackEffect(inst: Instruction, func: *const Function, functions: [
             const callee = &instantiated_functions[call.func_instantiation];
             return .{ .pop = callee.param_count, .push = callee.return_count };
         },
-        .pack => |n| .{ .pop = @intCast(n), .push = 1 },
+        .pack => |def_idx| {
+            if (def_idx >= func.struct_defs.len) return error.InvalidFieldIndex;
+            const n = func.struct_defs[def_idx].fields.items.len;
+            return .{ .pop = @intCast(n), .push = 1 };
+        },
         .unpack => |n| .{ .pop = 1, .push = @intCast(n) },
         .pack_generic => |type_inst| .{ .pop = try resolveGenericStructFieldCount(func, type_inst), .push = 1 },
         .unpack_generic => |type_inst| .{ .pop = 1, .push = try resolveGenericStructFieldCount(func, type_inst) },
@@ -90,12 +100,18 @@ fn instructionStackEffect(inst: Instruction, func: *const Function, functions: [
         .cast_u8, .cast_u16, .cast_u32, .cast_u64, .cast_u128, .cast_u256 => .{ .pop = 1, .push = 1 },
         .abort => .{ .pop = 1, .push = 0 },
         .nop => .{ .pop = 0, .push = 0 },
-        .vec_pack => |vp| .{ .pop = @intCast(vp.num), .push = 1 },
+        .vec_pack => |vp| {
+            if (vp.num > std.math.maxInt(i32)) return error.InvalidInstruction;
+            return .{ .pop = @intCast(vp.num), .push = 1 };
+        },
         .vec_len => .{ .pop = 1, .push = 1 },
         .vec_imm_borrow, .vec_mut_borrow => .{ .pop = 2, .push = 1 },
         .vec_push_back => .{ .pop = 2, .push = 0 },
         .vec_pop_back => .{ .pop = 1, .push = 1 },
-        .vec_unpack => |vu| .{ .pop = 1, .push = @intCast(vu.num) },
+        .vec_unpack => |vu| {
+            if (vu.num > std.math.maxInt(i32)) return error.InvalidInstruction;
+            return .{ .pop = 1, .push = @intCast(vu.num) };
+        },
         .vec_swap => .{ .pop = 3, .push = 0 },
         .move_to => .{ .pop = 2, .push = 0 },
         .move_from => .{ .pop = 1, .push = 1 },
@@ -118,6 +134,25 @@ fn isIntegerTag(tag: ?TypeTag) bool {
 
 fn typeToTag(ty: types.Type) ?TypeTag {
     return switch (ty) {
+        .Bool => .Bool,
+        .U8 => .U8,
+        .U16 => .U16,
+        .U32 => .U32,
+        .U64 => .U64,
+        .U128 => .U128,
+        .U256 => .U256,
+        .Address => .Address,
+        .Signer => .Signer,
+        .Vector => .Vector,
+        .Struct => .Struct,
+        .Reference => .Reference,
+        .MutableReference => .MutableReference,
+        .TypeParameter => null,
+    };
+}
+
+fn typeSignatureToTag(ts: module_mod.TypeSignature) ?TypeTag {
+    return switch (ts) {
         .Bool => .Bool,
         .U8 => .U8,
         .U16 => .U16,
@@ -236,7 +271,11 @@ fn applyTypeEffect(
         .ld_u128 => try ctx.push(allocator, .U128),
         .ld_u256 => try ctx.push(allocator, .U256),
         .ld_true, .ld_false => try ctx.push(allocator, .Bool),
-        .ld_const => try ctx.push(allocator, null),
+        .ld_const => |lc| {
+            if (lc.const_idx >= func.constants.len) return error.InvalidInstruction;
+            const tag = typeSignatureToTag(func.constants[lc.const_idx].type_signature);
+            try ctx.push(allocator, tag);
+        },
         .ld_addr => try ctx.push(allocator, .Address),
         .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor, .shl, .shr => {
             const b = try ctx.pop();
@@ -295,22 +334,53 @@ fn applyTypeEffect(
             if (func.function_handles.len > 0) {
                 if (call.func >= func.function_handles.len) return error.InvalidFunctionIndex;
                 const handle = func.function_handles[call.func];
+                const resolved = if (call.func < func.resolved_handles.len) func.resolved_handles[call.func] else null;
                 const pop_count = if (handle.param_types.len > 0)
                     handle.param_types.len
+                else if (resolved) |r|
+                    r.param_count
                 else if (call.func < functions.len)
                     functions[call.func].param_count
                 else
                     0;
                 const push_count = if (handle.return_types.len > 0)
                     handle.return_types.len
+                else if (resolved) |r|
+                    r.return_count
                 else if (call.func < functions.len)
                     functions[call.func].return_count
                 else
                     0;
+                // Type-check arguments when callee is resolved or available in functions array
                 var i: usize = pop_count;
-                while (i > 0) { i -= 1; _ = try ctx.pop(); }
-                for (0..push_count) |_| {
-                    try ctx.push(allocator, null);
+                while (i > 0) {
+                    i -= 1;
+                    const actual = try ctx.pop();
+                    if (resolved) |r| {
+                        if (r.param_types.items.len > i) {
+                            const expected = typeToTag(r.param_types.items[i]);
+                            if (actual != null and actual != expected) return error.TypeMismatch;
+                        }
+                    } else if (call.func < functions.len) {
+                        const callee = &functions[call.func];
+                        if (callee.param_types.items.len > i) {
+                            const expected = typeToTag(callee.param_types.items[i]);
+                            if (actual != null and actual != expected) return error.TypeMismatch;
+                        }
+                    }
+                }
+                if (resolved) |r| {
+                    for (0..push_count) |j| {
+                        const ret_tag = if (r.return_types.items.len > j)
+                            typeToTag(r.return_types.items[j])
+                        else
+                            null;
+                        try ctx.push(allocator, ret_tag);
+                    }
+                } else {
+                    for (0..push_count) |_| {
+                        try ctx.push(allocator, null);
+                    }
                 }
             } else {
                 if (call.func >= functions.len) return error.InvalidFunctionIndex;
@@ -353,10 +423,16 @@ fn applyTypeEffect(
                 try ctx.push(allocator, ret_tag);
             }
         },
-        .pack => |n| {
-            var i: usize = 0;
-            while (i < n) : (i += 1) {
-                _ = try ctx.pop();
+        .pack => |def_idx| {
+            if (def_idx >= func.struct_defs.len) return error.InvalidFieldIndex;
+            const def = func.struct_defs[def_idx];
+            const n = def.fields.items.len;
+            var i: usize = n;
+            while (i > 0) {
+                i -= 1;
+                const actual = try ctx.pop();
+                const expected = typeSignatureToTag(def.fields.items[i].type_signature);
+                if (actual != null and actual != expected) return error.TypeMismatch;
             }
             try ctx.push(allocator, .Struct);
         },
@@ -370,9 +446,18 @@ fn applyTypeEffect(
         },
         .pack_generic => |type_inst| {
             const field_count = try resolveGenericStructFieldCount(func, type_inst);
-            var i: usize = 0;
-            while (i < field_count) : (i += 1) {
-                _ = try ctx.pop();
+            const resolved_field_types = if (type_inst < func.resolved_struct_field_types.len)
+                func.resolved_struct_field_types[type_inst].field_types
+            else
+                &.{};
+            var i: usize = field_count;
+            while (i > 0) {
+                i -= 1;
+                const actual = try ctx.pop();
+                if (resolved_field_types.len > i) {
+                    const expected = typeToTag(resolved_field_types[i]);
+                    if (actual != null and actual != expected) return error.TypeMismatch;
+                }
             }
             try ctx.push(allocator, .Struct);
         },
@@ -380,9 +465,14 @@ fn applyTypeEffect(
             const field_count = try resolveGenericStructFieldCount(func, type_inst);
             const ty = try ctx.pop();
             if (ty != null and ty != .Struct) return error.TypeMismatch;
+            const resolved_field_types = if (type_inst < func.resolved_struct_field_types.len)
+                func.resolved_struct_field_types[type_inst].field_types
+            else
+                &.{};
             var i: usize = 0;
             while (i < field_count) : (i += 1) {
-                try ctx.push(allocator, null);
+                const tag = if (resolved_field_types.len > i) typeToTag(resolved_field_types[i]) else null;
+                try ctx.push(allocator, tag);
             }
         },
         .mut_borrow_loc => try ctx.push(allocator, .MutableReference),
@@ -536,8 +626,13 @@ pub fn verifyFunction(
     instantiated_functions: []const Function,
     max_stack: u32,
 ) VerifierError!void {
-    // Native functions have no bytecode to verify
-    if (func.is_native) return;
+    // Native functions have no bytecode, but we still verify signature consistency
+    if (func.is_native) {
+        if (func.param_types.items.len > 0 and func.param_count != func.param_types.items.len) return error.TypeMismatch;
+        if (func.return_types.items.len > 0 and func.return_count != func.return_types.items.len) return error.TypeMismatch;
+        if (func.local_count < func.param_count) return error.InvalidLocalIndex;
+        return;
+    }
 
     const code = func.code.instructions.items;
     if (code.len == 0) {

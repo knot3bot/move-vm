@@ -17,6 +17,8 @@ pub const CompiledModule = struct {
     instantiated_functions: []Function,
     instantiated_function_ty_args: [][]types.Type,
     dependencies: []types.ModuleId,
+    resolved_handles: []?*Function,
+    resolved_struct_field_types: []types.ResolvedStructFieldTypes,
 
     pub fn deinit(self: *CompiledModule, allocator: std.mem.Allocator) void {
         for (self.functions) |*func| {
@@ -36,6 +38,14 @@ pub const CompiledModule = struct {
         }
         allocator.free(self.instantiated_function_ty_args);
         allocator.free(self.dependencies);
+        allocator.free(self.resolved_handles);
+        for (self.resolved_struct_field_types) |rsft| {
+            for (rsft.field_types) |*ty| {
+                ty.deinit(allocator);
+            }
+            allocator.free(rsft.field_types);
+        }
+        allocator.free(self.resolved_struct_field_types);
     }
 };
 
@@ -160,12 +170,11 @@ pub const Loader = struct {
             func.struct_instantiations = module.struct_instantiations.items;
             func.constants = module.constants.items;
             func.function_handles = module.functions.items;
-            func.function_handles = module.functions.items;
 
             // Convert type signature indices to types
             for (handle.param_types) |ty_idx| {
                 if (ty_idx < module.type_signatures.items.len) {
-                    const ty = typeSignatureToType(module.type_signatures.items[ty_idx], module, self.allocator) catch .U64;
+                    const ty = try typeSignatureToType(module.type_signatures.items[ty_idx], module, self.allocator);
                     try func.param_types.append(self.allocator, ty);
                 } else {
                     try func.param_types.append(self.allocator, .U64);
@@ -173,7 +182,7 @@ pub const Loader = struct {
             }
             for (handle.return_types) |ty_idx| {
                 if (ty_idx < module.type_signatures.items.len) {
-                    const ty = typeSignatureToType(module.type_signatures.items[ty_idx], module, self.allocator) catch .U64;
+                    const ty = try typeSignatureToType(module.type_signatures.items[ty_idx], module, self.allocator);
                     try func.return_types.append(self.allocator, ty);
                 } else {
                     try func.return_types.append(self.allocator, .U64);
@@ -188,6 +197,35 @@ pub const Loader = struct {
             functions[i] = func;
             names[i] = handle.name;
             funcs_initialized += 1;
+        }
+
+        // Resolve function handles to actual Function pointers for cross-module calls
+        const resolved_handles = try self.allocator.alloc(?*Function, module.functions.items.len);
+        errdefer self.allocator.free(resolved_handles);
+        @memset(resolved_handles, null);
+
+        for (module.functions.items, 0..) |handle, i| {
+            if (std.mem.eql(u8, handle.module.name, module.id.name) and
+                std.mem.eql(u8, &handle.module.address, &module.id.address))
+            {
+                // Local function: find in compiled functions array
+                for (names, 0..) |fname, j| {
+                    if (std.mem.eql(u8, fname, handle.name)) {
+                        resolved_handles[i] = &functions[j];
+                        break;
+                    }
+                }
+            } else {
+                // External function: look up in already-loaded modules
+                if (try self.getFunctionByName(handle.module, handle.name)) |func| {
+                    resolved_handles[i] = func;
+                }
+            }
+        }
+
+        // Attach resolved handles to all functions for verifier/interpreter use
+        for (functions) |*func| {
+            func.resolved_handles = resolved_handles;
         }
 
         // Compile function instantiations for generic calls
@@ -262,11 +300,37 @@ pub const Loader = struct {
             errdefer self.allocator.free(inst_ty_args[i]);
             for (func_inst.type_args, 0..) |ty_idx, j| {
                 if (ty_idx < module.type_signatures.items.len) {
-                    inst_ty_args[i][j] = typeSignatureToType(module.type_signatures.items[ty_idx], module, self.allocator) catch .U64;
+                    inst_ty_args[i][j] = try typeSignatureToType(module.type_signatures.items[ty_idx], module, self.allocator);
                 } else {
                     inst_ty_args[i][j] = .U64;
                 }
             }
+        }
+
+        // Pre-compute resolved field types for generic struct instantiations (TypeParameter -> concrete type)
+        const resolved_struct_field_types = try self.allocator.alloc(types.ResolvedStructFieldTypes, module.struct_instantiations.items.len);
+        errdefer {
+            for (resolved_struct_field_types) |*rsft| {
+                for (rsft.field_types) |*ty| ty.deinit(self.allocator);
+                self.allocator.free(rsft.field_types);
+            }
+            self.allocator.free(resolved_struct_field_types);
+        }
+        for (module.struct_instantiations.items, 0..) |inst, i| {
+            if (inst.def >= module.struct_defs.items.len) {
+                return error.InvalidStructDef;
+            }
+            const def = module.struct_defs.items[inst.def];
+            const field_types = try self.allocator.alloc(types.Type, def.fields.items.len);
+            for (def.fields.items, 0..) |field, j| {
+                field_types[j] = try typeSignatureToTypeImpl(field.type_signature, module, self.allocator, inst.type_args);
+            }
+            resolved_struct_field_types[i] = .{ .field_types = field_types };
+        }
+
+        // Attach resolved struct field types to all functions
+        for (functions) |*func| {
+            func.resolved_struct_field_types = resolved_struct_field_types;
         }
 
         // Collect dependencies
@@ -281,6 +345,8 @@ pub const Loader = struct {
             .instantiated_functions = inst_functions,
             .instantiated_function_ty_args = inst_ty_args,
             .dependencies = dep_slice,
+            .resolved_handles = resolved_handles,
+            .resolved_struct_field_types = resolved_struct_field_types,
         };
 
         // Verify all functions before caching
@@ -303,7 +369,8 @@ pub const Loader = struct {
         }
     }
 
-    fn typeSignatureToType(ts: module_mod.TypeSignature, module: *const module_mod.Module, allocator: std.mem.Allocator) !types.Type {
+    /// Convert a TypeSignature to a runtime Type, optionally substituting TypeParameters.
+    fn typeSignatureToTypeImpl(ts: module_mod.TypeSignature, module: *const module_mod.Module, allocator: std.mem.Allocator, type_args: ?[]const u16) !types.Type {
         return switch (ts) {
             .Bool => .Bool,
             .U8 => .U8,
@@ -314,10 +381,20 @@ pub const Loader = struct {
             .U256 => .U256,
             .Address => .Address,
             .Signer => .Signer,
-            .TypeParameter => |idx| .{ .TypeParameter = idx },
+            .TypeParameter => |idx| {
+                if (type_args) |args| {
+                    if (idx < args.len) {
+                        const concrete_idx = args[idx];
+                        if (concrete_idx < module.type_signatures.items.len) {
+                            return typeSignatureToTypeImpl(module.type_signatures.items[concrete_idx], module, allocator, null);
+                        }
+                    }
+                }
+                return .{ .TypeParameter = idx };
+            },
             .Vector => |idx| {
                 if (idx >= module.type_signatures.items.len) return error.InvalidType;
-                const inner = try typeSignatureToType(module.type_signatures.items[idx], module, allocator);
+                const inner = try typeSignatureToTypeImpl(module.type_signatures.items[idx], module, allocator, type_args);
                 const ptr = try allocator.create(types.Type);
                 ptr.* = inner;
                 return .{ .Vector = ptr };
@@ -328,25 +405,29 @@ pub const Loader = struct {
                 const field_types = try allocator.alloc(types.Type, def.fields.items.len);
                 errdefer allocator.free(field_types);
                 for (def.fields.items, 0..) |field, i| {
-                    field_types[i] = try typeSignatureToType(field.type_signature, module, allocator);
+                    field_types[i] = try typeSignatureToTypeImpl(field.type_signature, module, allocator, type_args);
                 }
                 return .{ .Struct = .{ .handle = idx, .field_types = field_types } };
             },
             .Reference => |idx| {
                 if (idx >= module.type_signatures.items.len) return error.InvalidType;
-                const inner = try typeSignatureToType(module.type_signatures.items[idx], module, allocator);
+                const inner = try typeSignatureToTypeImpl(module.type_signatures.items[idx], module, allocator, type_args);
                 const ptr = try allocator.create(types.Type);
                 ptr.* = inner;
                 return .{ .Reference = ptr };
             },
             .MutableReference => |idx| {
                 if (idx >= module.type_signatures.items.len) return error.InvalidType;
-                const inner = try typeSignatureToType(module.type_signatures.items[idx], module, allocator);
+                const inner = try typeSignatureToTypeImpl(module.type_signatures.items[idx], module, allocator, type_args);
                 const ptr = try allocator.create(types.Type);
                 ptr.* = inner;
                 return .{ .MutableReference = ptr };
             },
         };
+    }
+
+    fn typeSignatureToType(ts: module_mod.TypeSignature, module: *const module_mod.Module, allocator: std.mem.Allocator) !types.Type {
+        return typeSignatureToTypeImpl(ts, module, allocator, null);
     }
 
     /// Get a function by module ID and function index.

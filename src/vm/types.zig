@@ -1,5 +1,11 @@
 const std = @import("std");
 
+/// Resolved field types for a generic struct instantiation.
+/// Used by the loader to pre-compute concrete types after TypeParameter substitution.
+pub const ResolvedStructFieldTypes = struct {
+    field_types: []Type,
+};
+
 /// Runtime type representation
 pub const Type = union(enum) {
     Bool,

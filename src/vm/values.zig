@@ -13,6 +13,7 @@ pub const Container = struct {
     kind: Kind,
     data: std.ArrayList(ValueImpl),
     abilities: types.AbilitySet,
+    ref_count: u32,
 
     pub const Kind = enum {
         Vec,
@@ -26,6 +27,7 @@ pub const Container = struct {
             .kind = kind,
             .data = std.ArrayList(ValueImpl).empty,
             .abilities = types.AbilitySet.default(),
+            .ref_count = 0,
         };
         return ptr;
     }
@@ -37,6 +39,7 @@ pub const Container = struct {
             .kind = kind,
             .data = std.ArrayList(ValueImpl).empty,
             .abilities = abilities,
+            .ref_count = 0,
         };
         return ptr;
     }
@@ -44,10 +47,12 @@ pub const Container = struct {
     /// Deep-copy this container.
     pub fn copy_value(self: *Container, allocator: std.mem.Allocator) error{OutOfMemory}!*Container {
         const ptr = try allocator.create(Container);
+        errdefer ptr.deinit(allocator);
         ptr.* = .{
             .kind = self.kind,
             .data = std.ArrayList(ValueImpl).empty,
             .abilities = self.abilities,
+            .ref_count = 0,
         };
         for (self.data.items) |item| {
             try ptr.data.append(allocator, try item.copy_value(allocator));
@@ -59,6 +64,9 @@ pub const Container = struct {
     pub fn deinit(self: *Container, allocator: std.mem.Allocator) void {
         for (self.data.items) |*item| {
             item.deinit(allocator);
+        }
+        if (self.ref_count != 0) {
+            @panic("Container.deinit called with active references");
         }
         self.data.deinit(allocator);
         allocator.destroy(self);
@@ -86,6 +94,10 @@ pub const ContainerRef = struct {
     is_mutable: bool = true,
     is_global: bool = false,
     global_status: ?*GlobalDataStatus = null,
+    // For global borrows: address and type_key are duplicated to enable
+    // transaction logging on write_ref and borrow tracking on move_to/move_from.
+    global_address: ?[]const u8 = null,
+    global_type_key: ?[]const u8 = null,
 };
 
 /// A reference to an element inside a container.
@@ -124,21 +136,32 @@ pub const ValueImpl = union(enum) {
             .Bool => |x| .{ .Bool = x },
             .Address => |x| .{ .Address = x },
             .Container => |c| .{ .Container = try c.copy_value(allocator) },
-            .ContainerRef => |r| .{ .ContainerRef = .{
-                .container = r.container,
-                .is_mutable = r.is_mutable,
-                .is_global = r.is_global,
-                .global_status = r.global_status,
-            } },
-            .IndexedRef => |r| .{ .IndexedRef = .{
-                .container_ref = .{
-                    .container = r.container_ref.container,
-                    .is_mutable = r.container_ref.is_mutable,
-                    .is_global = r.container_ref.is_global,
-                    .global_status = r.container_ref.global_status,
-                },
-                .idx = r.idx,
-            } },
+            .ContainerRef => |r| {
+                r.container.ref_count += 1;
+                const addr_copy = if (r.global_address) |addr| try allocator.dupe(u8, addr) else null;
+                errdefer if (addr_copy) |a| allocator.free(a);
+                const tk_copy = if (r.global_type_key) |tk| try allocator.dupe(u8, tk) else null;
+                return .{ .ContainerRef = .{
+                    .container = r.container,
+                    .is_mutable = r.is_mutable,
+                    .is_global = r.is_global,
+                    .global_status = r.global_status,
+                    .global_address = addr_copy,
+                    .global_type_key = tk_copy,
+                } };
+            },
+            .IndexedRef => |r| {
+                r.container_ref.container.ref_count += 1;
+                return .{ .IndexedRef = .{
+                    .container_ref = .{
+                        .container = r.container_ref.container,
+                        .is_mutable = r.container_ref.is_mutable,
+                        .is_global = r.container_ref.is_global,
+                        .global_status = r.container_ref.global_status,
+                    },
+                    .idx = r.idx,
+                } };
+            },
         };
     }
 
@@ -170,6 +193,14 @@ pub const ValueImpl = union(enum) {
     pub fn deinit(self: *ValueImpl, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .Container => |c| c.deinit(allocator),
+            .ContainerRef => |r| {
+                r.container.ref_count -= 1;
+                if (r.global_address) |addr| allocator.free(addr);
+                if (r.global_type_key) |tk| allocator.free(tk);
+            },
+            .IndexedRef => |r| {
+                r.container_ref.container.ref_count -= 1;
+            },
             else => {},
         }
     }
@@ -178,7 +209,10 @@ pub const ValueImpl = union(enum) {
     pub fn read_ref(self: ValueImpl, allocator: std.mem.Allocator) !ValueImpl {
         return switch (self) {
             .ContainerRef => |r| .{ .Container = try r.container.copy_value(allocator) },
-            .IndexedRef => |r| try r.container_ref.container.data.items[r.idx].copy_value(allocator),
+            .IndexedRef => |r| {
+                if (r.idx >= r.container_ref.container.data.items.len) return error.IndexOutOfBounds;
+                return try r.container_ref.container.data.items[r.idx].copy_value(allocator);
+            },
             else => error.TypeMismatch,
         };
     }
@@ -188,6 +222,7 @@ pub const ValueImpl = union(enum) {
         switch (self.*) {
             .ContainerRef => |*r| {
                 if (!r.is_mutable) return error.InvalidReference;
+                if (r.container.ref_count > 1) return error.InvalidReference;
                 switch (value) {
                     .Container => |src| {
                         if (r.container.kind != src.kind) return error.TypeMismatch;
@@ -210,6 +245,9 @@ pub const ValueImpl = union(enum) {
             },
             .IndexedRef => |*r| {
                 if (!r.container_ref.is_mutable) return error.InvalidReference;
+                if (r.idx >= r.container_ref.container.data.items.len) return error.IndexOutOfBounds;
+                const old = r.container_ref.container.data.items[r.idx];
+                if (old == .Container and old.Container.ref_count > 0) return error.InvalidReference;
                 const new_val = try value.copy_value(allocator);
                 r.container_ref.container.data.items[r.idx].deinit(allocator);
                 r.container_ref.container.data.items[r.idx] = new_val;
@@ -231,16 +269,22 @@ pub const ValueImpl = union(enum) {
                 if (idx >= r.container.data.items.len) return error.IndexOutOfBounds;
                 const item = r.container.data.items[idx];
                 switch (item) {
-                    .Container => |c| return .{ .ContainerRef = .{
-                        .container = c,
-                        .is_mutable = r.is_mutable,
-                        .is_global = r.is_global,
-                        .global_status = r.global_status,
-                    } },
-                    else => return .{ .IndexedRef = .{
-                        .container_ref = r,
-                        .idx = idx,
-                    } },
+                    .Container => |c| {
+                        c.ref_count += 1;
+                        return .{ .ContainerRef = .{
+                            .container = c,
+                            .is_mutable = r.is_mutable,
+                            .is_global = r.is_global,
+                            .global_status = r.global_status,
+                        } };
+                    },
+                    else => {
+                        r.container.ref_count += 1;
+                        return .{ .IndexedRef = .{
+                            .container_ref = r,
+                            .idx = idx,
+                        } };
+                    },
                 }
             },
             else => return error.TypeMismatch,
@@ -255,16 +299,22 @@ pub const ValueImpl = union(enum) {
                 if (idx >= r.container.data.items.len) return error.IndexOutOfBounds;
                 const item = r.container.data.items[idx];
                 switch (item) {
-                    .Container => |c| return .{ .ContainerRef = .{
-                        .container = c,
-                        .is_mutable = r.is_mutable,
-                        .is_global = r.is_global,
-                        .global_status = r.global_status,
-                    } },
-                    else => return .{ .IndexedRef = .{
-                        .container_ref = r,
-                        .idx = idx,
-                    } },
+                    .Container => |c| {
+                        c.ref_count += 1;
+                        return .{ .ContainerRef = .{
+                            .container = c,
+                            .is_mutable = r.is_mutable,
+                            .is_global = r.is_global,
+                            .global_status = r.global_status,
+                        } };
+                    },
+                    else => {
+                        r.container.ref_count += 1;
+                        return .{ .IndexedRef = .{
+                            .container_ref = r,
+                            .idx = idx,
+                        } };
+                    },
                 }
             },
             else => return error.TypeMismatch,
@@ -300,7 +350,7 @@ pub const ValueImpl = union(enum) {
     /// Check if this value can be dropped.
     pub fn canDrop(self: ValueImpl) bool {
         return switch (self) {
-            .Container => |c| c.abilities.can_drop,
+            .Container => |c| c.abilities.can_drop and c.ref_count == 0,
             else => true,
         };
     }
@@ -433,6 +483,7 @@ pub const IntegerValue = union(enum) {
     }
 
     pub fn add_checked(a: IntegerValue, b: IntegerValue) !IntegerValue {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return error.TypeMismatch;
         return switch (a) {
             .U8 => |x| .{ .U8 = try std.math.add(u8, x, b.U8) },
             .U16 => |x| .{ .U16 = try std.math.add(u16, x, b.U16) },
@@ -444,6 +495,7 @@ pub const IntegerValue = union(enum) {
     }
 
     pub fn sub_checked(a: IntegerValue, b: IntegerValue) !IntegerValue {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return error.TypeMismatch;
         return switch (a) {
             .U8 => |x| .{ .U8 = try std.math.sub(u8, x, b.U8) },
             .U16 => |x| .{ .U16 = try std.math.sub(u16, x, b.U16) },
@@ -455,6 +507,7 @@ pub const IntegerValue = union(enum) {
     }
 
     pub fn mul_checked(a: IntegerValue, b: IntegerValue) !IntegerValue {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return error.TypeMismatch;
         return switch (a) {
             .U8 => |x| .{ .U8 = try std.math.mul(u8, x, b.U8) },
             .U16 => |x| .{ .U16 = try std.math.mul(u16, x, b.U16) },
@@ -466,6 +519,7 @@ pub const IntegerValue = union(enum) {
     }
 
     pub fn div_checked(a: IntegerValue, b: IntegerValue) !IntegerValue {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return error.TypeMismatch;
         if (b.isZero()) return error.DivisionByZero;
         return switch (a) {
             .U8 => |x| .{ .U8 = try std.math.divTrunc(u8, x, b.U8) },
@@ -478,6 +532,7 @@ pub const IntegerValue = union(enum) {
     }
 
     pub fn rem_checked(a: IntegerValue, b: IntegerValue) !IntegerValue {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return error.TypeMismatch;
         if (b.isZero()) return error.DivisionByZero;
         return switch (a) {
             .U8 => |x| .{ .U8 = try std.math.rem(u8, x, b.U8) },
@@ -490,6 +545,7 @@ pub const IntegerValue = union(enum) {
     }
 
     pub fn bit_or(a: IntegerValue, b: IntegerValue) !IntegerValue {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return error.TypeMismatch;
         return switch (a) {
             .U8 => |x| .{ .U8 = x | b.U8 },
             .U16 => |x| .{ .U16 = x | b.U16 },
@@ -501,6 +557,7 @@ pub const IntegerValue = union(enum) {
     }
 
     pub fn bit_and(a: IntegerValue, b: IntegerValue) !IntegerValue {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return error.TypeMismatch;
         return switch (a) {
             .U8 => |x| .{ .U8 = x & b.U8 },
             .U16 => |x| .{ .U16 = x & b.U16 },
@@ -512,6 +569,7 @@ pub const IntegerValue = union(enum) {
     }
 
     pub fn bit_xor(a: IntegerValue, b: IntegerValue) !IntegerValue {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return error.TypeMismatch;
         return switch (a) {
             .U8 => |x| .{ .U8 = x ^ b.U8 },
             .U16 => |x| .{ .U16 = x ^ b.U16 },
@@ -523,17 +581,38 @@ pub const IntegerValue = union(enum) {
     }
 
     pub fn shl_checked(a: IntegerValue, b: IntegerValue) !IntegerValue {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return error.TypeMismatch;
         return switch (a) {
-            .U8 => |x| .{ .U8 = try std.math.shlExact(u8, x, @intCast(b.U8)) },
-            .U16 => |x| .{ .U16 = try std.math.shlExact(u16, x, @intCast(b.U16)) },
-            .U32 => |x| .{ .U32 = try std.math.shlExact(u32, x, @intCast(b.U32)) },
-            .U64 => |x| .{ .U64 = try std.math.shlExact(u64, x, @intCast(b.U64)) },
-            .U128 => |x| .{ .U128 = try std.math.shlExact(u128, x, @intCast(b.U128)) },
-            .U256 => |x| .{ .U256 = x << @as(u8, @intCast(b.U256 & 0xFF)) },
+            .U8 => |x| {
+                if (b.U8 >= 8) return error.Overflow;
+                return .{ .U8 = try std.math.shlExact(u8, x, @intCast(b.U8)) };
+            },
+            .U16 => |x| {
+                if (b.U16 >= 16) return error.Overflow;
+                return .{ .U16 = try std.math.shlExact(u16, x, @intCast(b.U16)) };
+            },
+            .U32 => |x| {
+                if (b.U32 >= 32) return error.Overflow;
+                return .{ .U32 = try std.math.shlExact(u32, x, @intCast(b.U32)) };
+            },
+            .U64 => |x| {
+                if (b.U64 >= 64) return error.Overflow;
+                return .{ .U64 = try std.math.shlExact(u64, x, @intCast(b.U64)) };
+            },
+            .U128 => |x| {
+                if (b.U128 >= 128) return error.Overflow;
+                return .{ .U128 = try std.math.shlExact(u128, x, @intCast(b.U128)) };
+            },
+            .U256 => |x| {
+                const shift: u8 = @intCast(b.U256 & 0xFF);
+                if (shift >= 256) return error.Overflow;
+                return .{ .U256 = x << shift };
+            },
         };
     }
 
     pub fn shr_checked(a: IntegerValue, b: IntegerValue) !IntegerValue {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return error.TypeMismatch;
         if (b.isZero()) return a;
         return switch (a) {
             .U8 => |x| .{ .U8 = std.math.shr(u8, x, b.U8) },
@@ -546,6 +625,7 @@ pub const IntegerValue = union(enum) {
     }
 
     pub fn lt(a: IntegerValue, b: IntegerValue) !bool {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return error.TypeMismatch;
         return switch (a) {
             .U8 => |x| x < b.U8,
             .U16 => |x| x < b.U16,
@@ -557,6 +637,7 @@ pub const IntegerValue = union(enum) {
     }
 
     pub fn gt(a: IntegerValue, b: IntegerValue) !bool {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return error.TypeMismatch;
         return switch (a) {
             .U8 => |x| x > b.U8,
             .U16 => |x| x > b.U16,
@@ -568,6 +649,7 @@ pub const IntegerValue = union(enum) {
     }
 
     pub fn le(a: IntegerValue, b: IntegerValue) !bool {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return error.TypeMismatch;
         return switch (a) {
             .U8 => |x| x <= b.U8,
             .U16 => |x| x <= b.U16,
@@ -579,6 +661,7 @@ pub const IntegerValue = union(enum) {
     }
 
     pub fn ge(a: IntegerValue, b: IntegerValue) !bool {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return error.TypeMismatch;
         return switch (a) {
             .U8 => |x| x >= b.U8,
             .U16 => |x| x >= b.U16,
@@ -661,6 +744,7 @@ pub const IntegerValue = union(enum) {
 pub const StructValue = struct {
     pub fn pack(allocator: std.mem.Allocator, fields: []const Value, abilities: types.AbilitySet) !Value {
         const container = try Container.newWithAbilities(allocator, .Struct, abilities);
+        errdefer container.deinit(allocator);
         for (fields) |field| {
             try container.data.append(allocator, (try field.copy_value(allocator)).impl);
         }
@@ -686,6 +770,7 @@ pub const StructValue = struct {
 pub const VectorValue = struct {
     pub fn pack(allocator: std.mem.Allocator, elements: []const Value, abilities: types.AbilitySet) !Value {
         var container = try Container.newWithAbilities(allocator, .Vec, abilities);
+        errdefer container.deinit(allocator);
         for (elements) |elem| {
             try container.data.append(allocator, (try elem.copy_value(allocator)).impl);
         }
@@ -721,12 +806,14 @@ pub const VectorValue = struct {
                 if (r.container.kind != .Vec) return error.TypeMismatch;
                 const container_len = r.container.data.items.len;
                 if (container_len == 0) return error.IndexOutOfBounds;
-                const item = r.container.data.items[container_len - 1];
-                r.container.data.shrinkRetainingCapacity(container_len - 1);
+                var item = r.container.data.pop().?;
+                errdefer item.deinit(allocator);
+                const copied = try item.copy_value(allocator);
+                item.deinit(allocator);
                 if (r.is_global) {
                     if (r.global_status) |status| status.* = .Dirty;
                 }
-                return Value.init(try item.copy_value(allocator));
+                return Value.init(copied);
             },
             else => return error.TypeMismatch,
         }

@@ -146,10 +146,16 @@ pub const ModuleCache = struct {
     pub fn addModule(self: *ModuleCache, module: *Module) !void {
         const id_str = try module.id.toString(self.allocator);
         defer self.allocator.free(id_str);
-        try self.modules.put(id_str, module);
+        const id_copy = try self.allocator.dupe(u8, id_str);
+        errdefer self.allocator.free(id_copy);
+        try self.modules.put(id_copy, module);
     }
 
     pub fn deinit(self: *ModuleCache) void {
+        var it = self.modules.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
         self.modules.deinit();
     }
 };

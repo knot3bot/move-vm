@@ -60,6 +60,7 @@ pub const NativeFunctions = struct {
     }
 
     pub fn register(self: *NativeFunctions, module: []const u8, name: []const u8, func: NativeFunc) !u16 {
+        if (self.funcs.items.len > std.math.maxInt(u16)) return error.Overflow;
         const key = try std.fmt.allocPrint(self.functions.allocator, "{s}::{s}", .{ module, name });
         errdefer self.functions.allocator.free(key);
         const idx: u16 = @intCast(self.funcs.items.len);
@@ -143,7 +144,6 @@ pub fn nativeSha3_256(
     ty_args: []const types.Type,
     args: []Value,
 ) NativeError!NativeResult {
-    _ = ctx;
     _ = ty_args;
     if (args.len != 1) return error.TypeMismatch;
 
@@ -153,7 +153,12 @@ pub fn nativeSha3_256(
     };
     if (container.kind != .Vec) return error.TypeMismatch;
 
-    var input = try allocator.alloc(u8, container.data.items.len);
+    const input_len = container.data.items.len;
+    // Charge before expensive work to prevent unbounded free computation
+    const cost = 10 + input_len * 2;
+    if (ctx.gas_remaining < cost) return error.OutOfGas;
+
+    var input = try allocator.alloc(u8, input_len);
     defer allocator.free(input);
     for (container.data.items, 0..) |item, i| {
         input[i] = switch (item) {
@@ -173,7 +178,7 @@ pub fn nativeSha3_256(
 
     var vals = try allocator.alloc(Value, 1);
     vals[0] = Value.init(.{ .Container = result });
-    return .{ .cost = 10, .values = vals };
+    return .{ .cost = cost, .values = vals };
 }
 
 /// Native BCS to_bytes: args[0] (primitive) -> VectorU8

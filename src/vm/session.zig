@@ -102,30 +102,63 @@ pub const Session = struct {
         interp.setInstantiatedFunctions(inst_funcs);
         interp.setInstantiatedFunctionTyArgs(inst_ty_args);
         interp.setLoader(self.loader);
-        interp.setLoader(self.loader);
 
         // Begin transaction for atomic execution
         try self.storage.beginTransaction();
         errdefer self.storage.rollbackTransaction() catch {};
+        const prev_event_count = self.events.items.len;
+        errdefer {
+            // Rollback events emitted during this transaction
+            while (self.events.items.len > prev_event_count) {
+                if (self.events.pop()) |evt| {
+                    self.allocator.free(evt.data);
+                }
+            }
+        }
 
-        const result = try interp.executeFunction(
+        const result = interp.executeFunction(
             self.allocator,
             script,
             module_funcs,
             &.{},
             args,
             &self.gas_meter,
-        );
+        ) catch |err| {
+            if (err == error.Aborted) {
+                self.storage.rollbackTransaction() catch {};
+                while (self.events.items.len > prev_event_count) {
+                    if (self.events.pop()) |evt| {
+                        self.allocator.free(evt.data);
+                    }
+                }
+                return .{
+                    .status = .Aborted,
+                    .return_values = &.{},
+                    .events = &.{},
+                    .gas_used = self.gas_meter.getUsed(),
+                    .abort_code = interp.last_abort_code,
+                };
+            }
+            return err;
+        };
         errdefer result.deinit(self.allocator);
 
+        // Capture events before commit so OOM doesn't leave committed storage without events
+        const events = try self.takeEvents();
+        errdefer {
+            for (events) |*evt| self.allocator.free(evt.data);
+            self.allocator.free(events);
+        }
+
         // Commit transaction on success
-        self.storage.commitTransaction();
+        try self.storage.commitTransaction();
 
         return .{
             .status = .Success,
             .return_values = result.values,
-            .events = try self.takeEvents(),
+            .events = events,
             .gas_used = result.gas_used,
+            .abort_code = null,
         };
     }
 
@@ -142,6 +175,7 @@ pub const Session = struct {
                 .return_values = &.{},
                 .events = &.{},
                 .gas_used = 0,
+                .abort_code = null,
             };
         };
 
@@ -160,24 +194,56 @@ pub const Session = struct {
 
         try self.storage.beginTransaction();
         errdefer self.storage.rollbackTransaction() catch {};
+        const prev_event_count = self.events.items.len;
+        errdefer {
+            while (self.events.items.len > prev_event_count) {
+                if (self.events.pop()) |evt| {
+                    self.allocator.free(evt.data);
+                }
+            }
+        }
 
-        const result = try interp.executeFunction(
+        const result = interp.executeFunction(
             self.allocator,
             func,
             all_funcs,
             ty_args,
             args,
             &self.gas_meter,
-        );
+        ) catch |err| {
+            if (err == error.Aborted) {
+                self.storage.rollbackTransaction() catch {};
+                while (self.events.items.len > prev_event_count) {
+                    if (self.events.pop()) |evt| {
+                        self.allocator.free(evt.data);
+                    }
+                }
+                return .{
+                    .status = .Aborted,
+                    .return_values = &.{},
+                    .events = &.{},
+                    .gas_used = self.gas_meter.getUsed(),
+                    .abort_code = interp.last_abort_code,
+                };
+            }
+            return err;
+        };
         errdefer result.deinit(self.allocator);
 
-        self.storage.commitTransaction();
+        const events = try self.takeEvents();
+        errdefer {
+            for (events) |*evt| self.allocator.free(evt.data);
+            self.allocator.free(events);
+        }
+
+        try self.storage.commitTransaction();
 
         return .{
             .status = .Success,
             .return_values = result.values,
-            .events = try self.takeEvents(),
+            .events = events,
             .gas_used = result.gas_used,
+            .abort_code = null,
         };
     }
 
@@ -192,6 +258,7 @@ pub const ExecutionResult = struct {
     return_values: []Value,
     events: []Event,
     gas_used: u64,
+    abort_code: ?u64,
 
     pub fn deinit(self: ExecutionResult, allocator: std.mem.Allocator) void {
         for (self.return_values) |*val| {

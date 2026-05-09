@@ -69,18 +69,48 @@ src/
 - **Session/MoveVM API**: Full API with Loader integration, native function registry, event collection, and transaction semantics
 - **Generic operations**: Module context integration for pack_generic/unpack_generic/move_to_generic — resolves field counts and abilities from StructDefInstantiation
 - **Runtime ability checking**: copy_loc (can_copy), pop/store_loc (can_drop), move_to (is_key), write_ref (can_store)
-- **Tests**: 70/70 passing, zero memory leaks
+- **Runtime reference counting/lifetime validation**: Container-level `ref_count` tracking prevents UAF via `canDrop` (blocks pop/st_loc on referenced containers), `write_ref` guards (blocks whole-container write when `ref_count > 1`, blocks element overwrite when nested container has active refs), and `copy_value`/`deinit` ref-count bookkeeping for all `ContainerRef`/`IndexedRef` values
+- **Error-path UAF prevention**: Operand stack cleared before locals on interpreter error/abort, ensuring outstanding references decrement ref_counts before their backing containers are destroyed
+- **Storage API safety**: `getGlobalPtr` returns `?*Value` for borrows (prevents accidental deinit of stored containers); `borrow_global` increments `container.ref_count`
+- **Data-size gas scaling**: Proportional gas charges for linear-time operations (`eq`/`neq`, `pack`/`pack_generic`, `vec_pack`, `move_to`, `copy_loc`, `read_ref`, `write_ref`)
+- **Native function gas hardening**: Minimum gas charged on failure path; `nativeSha3_256` scales with input size
+- **Type resolution strictness**: Loader uses `try` propagation for all type resolution — no silent fallback to `.U64`
+- **Transaction atomicity**: Storage `removeGlobal` propagates errors; Session captures events before storage commit with `errdefer` rollback
+- **ModuleCache key duplication**: Keys duplicated before HashMap insertion (fixes dangling pointer UAF)
+- **OOM leak fixes**: `callee_locals`, `executeMain` return values, `move_to` resource copies all have `errdefer`/`defer` guards
+- **32-bit safety / intCast panics**: `vec_swap`, `vec_imm_borrow`, `vec_mut_borrow` check bounds before `@intCast`; `NativeFunctions.register` checks max u16; verifier validates `vec_pack`/`vec_unpack` counts
+- **Storage memory hygiene**: `DataStore.deinit` frees all module values and active change logs; `logChange` has `errdefer` for `old_copy`
+- **Abort code propagation**: `session.zig` captures `error.Aborted` and returns `ExecutionResult` with `abort_code`; `executeNative` propagates native abort codes via `last_abort_code`
+- **Module struct abilities in `pack`**: `.pack` instruction now uses `struct_defs[def_idx].abilities` instead of hardcoded defaults; verifier and interpreter both resolve field counts from struct definitions
+- **Verification cache**: `Interpreter` maintains `verified_set` (HashMap by function pointer) to skip redundant bytecode verification, preventing repeated gas consumption
+- **Native function signature verification**: Verifier checks `param_count`/`return_count`/`local_count` consistency for native functions instead of skipping entirely
+- **Cross-module call type checking**: Verifier type-checks arguments for `.call` when callee is resolved via `resolved_handles` or found in `functions` array
+- **Stack memory leak fixes**: `Stack.popn` deinits original slots before shrinking; `Stack.deinit`/`clearAndDeinit` iterate top-down to drop references before targets
+- **Container lifetime hardening**: `Container.deinit` uses `@panic` (all builds) when `ref_count != 0`; `IndexedRef` read/write check bounds before access
+- **OOM-path leak fixes**: `VectorValue.pop_back`, `Container.copy_value`, `StructValue.pack`, `VectorValue.pack` all have `errdefer` guards for partial-allocation failures
+- **Gas metering integer safety**: All data-size gas calculations use `@as(u64, ...)` widening to prevent `u16`/`usize` overflow before consumption
+- **Rollback hardening**: `rollbackTransaction` propagates `setGlobalInternal` errors instead of swallowing; `DataStore.deinit` cleans up active transaction logs
+- **Locals allocation gas metering**: `Locals.new` is charged proportional to `local_count` in both `executeFunction` and `.Call`/`.CallGeneric` paths
+- **Empty address map cleanup**: `removeGlobalInternal`/`takeGlobalInternal` delete the outer address entry when the inner map becomes empty
+- **Nested unpack leak fix**: `.unpack`/`.unpack_generic` defer blocks now deinit all unpacked values before freeing the ArrayList buffer
+- **Global borrow safety**: `setGlobalInternal`/`removeGlobalInternal`/`takeGlobalInternal` check `Container.ref_count > 0` and return `error.BorrowedResource` to prevent pointer invalidation
+- **Global write transaction logging**: `.write_ref` on a `borrow_global` result calls `store.logChange` before mutating, ensuring rollback can restore the old value
+- **ContainerRef global tracking**: `ContainerRef` carries duplicated `global_address`/`global_type_key` for transaction logging; `copy_value` deep-copies these strings; `deinit` frees them
+- **Tests**: 105/105 passing, zero memory leaks
+- **Transaction nesting**: `DataStore` supports nested transactions via a stack of change logs; inner commits merge into parent, inner rollbacks restore only their own scope
+- **`ld_const` type verification**: Verifier reads constant pool type signature and pushes correct `TypeTag` instead of `null`, enabling strict type checking for constant-loaded values
+- **`ld_const` full integer coverage**: `parseConstant` supports Bool, U8, U16, U32, U64, U128, U256, Address; tests cover all integer types and cross-type mismatch detection
 
 ### Known Limitations
-- Generic type parameter substitution is partial (resolves field counts and abilities from struct definitions, but does not replace TypeParameter with concrete types in field signatures)
-- write_ref via copied IndexedRef has a known edge case
+- ~~Generic type parameter substitution is partial~~ **Fixed**: Verifier now type-checks `.pack`/`.pack_generic` fields against `struct_defs`/`resolved_struct_field_types`, and `.unpack_generic` pushes concrete field types instead of `null`
+- Runtime borrow checker is defense-only (ref_count), not a full compile-time lifetime analysis — certain complex reference patterns may still pass runtime checks but violate Move semantics
 - Cross-module `Call` instructions use local function indices (no global function table linking)
-- Constant pool (ld_const) is not fully implemented
+- Constant pool (`ld_const`) supports primitive types only; Vector/Struct constants are not yet implemented
 - No concurrent execution support (single-threaded only)
+- Verifier unresolved handle bypass: When `call` handle is unresolved, verifier pushes `null` types, bypassing cross-module type checking
 
 ### Todo
-- Generic type parameter replacement in struct field signatures (TypeParameter -> concrete type)
-- Cross-module `Call` instruction linking via global function table
+- (empty — all planned items completed)
 
 ## Reference Sources
 

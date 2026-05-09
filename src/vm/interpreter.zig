@@ -70,6 +70,7 @@ pub const VMError = error{
     MissingStorage,
     MissingReturn,
     OutOfMemory,
+    BorrowedResource,
 };
 
 const storage_mod = @import("../storage/storage.zig");
@@ -86,6 +87,8 @@ pub const Interpreter = struct {
     max_call_depth: u32,
     events: ?*std.ArrayList(native_mod.Event),
     loader: ?*vm_loader.Loader,
+    last_abort_code: u64,
+    verified_set: std.AutoHashMap(usize, void),
 
     const Self = @This();
     const DEFAULT_MAX_CALL_DEPTH: u32 = 256;
@@ -107,12 +110,15 @@ pub const Interpreter = struct {
             .max_call_depth = max_call_depth,
             .events = null,
             .loader = null,
+            .last_abort_code = 0,
+            .verified_set = std.AutoHashMap(usize, void).init(allocator),
         };
     }
 
     pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
         self.operand_stack.deinit(allocator);
         self.call_stack.deinit(allocator);
+        self.verified_set.deinit();
     }
 
     pub fn setStorage(self: *Self, store: *storage_mod.DataStore) void {
@@ -183,7 +189,7 @@ pub const Interpreter = struct {
 
     /// Resolve generic struct info from a type instantiation index.
     /// Returns field count and abilities if module context is available.
-    fn resolveGenericStruct(func: *const Function, type_inst: u16) VMError!struct { field_count: u16, abilities: types.AbilitySet } {
+    pub fn resolveGenericStruct(func: *const Function, type_inst: u16) VMError!struct { field_count: u16, abilities: types.AbilitySet, field_types: []const types.Type } {
         if (type_inst >= func.struct_instantiations.len) {
             return error.InvalidInstruction;
         }
@@ -192,9 +198,14 @@ pub const Interpreter = struct {
             return error.InvalidInstruction;
         }
         const def = func.struct_defs[inst.def];
+        const resolved_field_types = if (type_inst < func.resolved_struct_field_types.len)
+            func.resolved_struct_field_types[type_inst].field_types
+        else
+            &.{};
         return .{
             .field_count = @intCast(def.fields.items.len),
             .abilities = def.abilities,
+            .field_types = resolved_field_types,
         };
     }
 
@@ -208,15 +219,81 @@ pub const Interpreter = struct {
         gas_meter: *Gas,
     ) VMError![]Value {
         var ctx = native_mod.NativeContext{ .gas_remaining = gas_meter.getRemaining(), .events = self.events };
-        const native_result = try native_func(allocator, &ctx, ty_args, native_args);
+        const native_result = native_func(allocator, &ctx, ty_args, native_args) catch |err| {
+            // Charge minimum overhead on failure to prevent free computation
+            gas_meter.consume(1) catch {};
+            return err;
+        };
         try gas_meter.consume(native_result.cost);
         if (native_result.is_abort) {
+            self.last_abort_code = native_result.abort_code;
             allocator.free(native_result.values);
             return error.Aborted;
         }
         const results = try allocator.dupe(Value, native_result.values);
         allocator.free(native_result.values);
         return results;
+    }
+
+    /// Charge additional gas for data-size-dependent operations.
+    fn chargeDataSizeGas(self: *Self, inst: bytecode.Instruction, gas_meter: *Gas) VMError!void {
+        switch (inst) {
+            .eq, .neq => {
+                if (self.operand_stack.values.items.len >= 2) {
+                    const rhs = self.operand_stack.values.items[self.operand_stack.values.items.len - 1];
+                    const lhs = self.operand_stack.values.items[self.operand_stack.values.items.len - 2];
+                    var extra: u64 = 0;
+                    if (rhs.impl == .Container) extra += @as(u64, rhs.impl.Container.data.items.len) * 2;
+                    if (lhs.impl == .Container) extra += @as(u64, lhs.impl.Container.data.items.len) * 2;
+                    try gas_meter.consume(extra);
+                }
+            },
+            .pack => |n| try gas_meter.consume(@as(u64, n) * 2),
+            .pack_generic => |type_inst| {
+                if (self.call_stack.items.len > 0) {
+                    const frame_func = self.call_stack.items[self.call_stack.items.len - 1].function;
+                    if (type_inst >= frame_func.struct_instantiations.len) return error.InvalidInstruction;
+                    const si = frame_func.struct_instantiations[type_inst];
+                    if (si.def >= frame_func.struct_defs.len) return error.InvalidInstruction;
+                    const n_fields = frame_func.struct_defs[si.def].fields.items.len;
+                    try gas_meter.consume(@as(u64, n_fields) * 2);
+                }
+            },
+            .vec_pack => |vp| try gas_meter.consume(@as(u64, vp.num) * 2),
+            .move_to => {
+                if (self.operand_stack.values.items.len >= 1) {
+                    const res = self.operand_stack.values.items[self.operand_stack.values.items.len - 1];
+                    if (res.impl == .Container) {
+                        try gas_meter.consume(@as(u64, res.impl.Container.data.items.len) * 2);
+                    }
+                }
+            },
+            .move_to_generic => {
+                if (self.operand_stack.values.items.len >= 1) {
+                    const res = self.operand_stack.values.items[self.operand_stack.values.items.len - 1];
+                    if (res.impl == .Container) {
+                        try gas_meter.consume(@as(u64, res.impl.Container.data.items.len) * 2);
+                    }
+                }
+            },
+            .read_ref => {
+                if (self.operand_stack.values.items.len >= 1) {
+                    const ref = self.operand_stack.values.items[self.operand_stack.values.items.len - 1];
+                    if (ref.impl == .ContainerRef) {
+                        try gas_meter.consume(@as(u64, ref.impl.ContainerRef.container.data.items.len) * 2);
+                    }
+                }
+            },
+            .write_ref => {
+                if (self.operand_stack.values.items.len >= 2) {
+                    const val = self.operand_stack.values.items[self.operand_stack.values.items.len - 1];
+                    if (val.impl == .Container) {
+                        try gas_meter.consume(@as(u64, val.impl.Container.data.items.len) * 2);
+                    }
+                }
+            },
+            else => {},
+        }
     }
 
     /// Entry point: execute a function with arguments.
@@ -229,25 +306,30 @@ pub const Interpreter = struct {
         args: []const Value,
         gas_meter: *Gas,
     ) VMError!ExecutionResult {
-        // Mandatory bytecode verification before execution
-        vm_verifier.verifyFunction(allocator, func, functions, self.instantiated_functions, self.operand_stack.max_size) catch |verr| {
-            return switch (verr) {
-                error.StackUnderflow => error.StackUnderflow,
-                error.StackOverflow => error.StackOverflow,
-                error.TypeMismatch => error.TypeMismatch,
-                error.InvalidLocalIndex => error.InvalidLocal,
-                error.InvalidBranchTarget => error.InvalidInstruction,
-                error.InvalidFieldIndex => error.InvalidInstruction,
-                error.InvalidFunctionIndex => error.FunctionNotFound,
-                error.InvalidInstruction => error.InvalidInstruction,
-                error.ExtraValueOnStack => error.InvalidInstruction,
-                error.MissingReturn => error.MissingReturn,
-                error.OutOfMemory => error.OutOfMemory,
+        // Mandatory bytecode verification before execution (cached to avoid repeated gas consumption)
+        const func_ptr = @intFromPtr(func);
+        if (!self.verified_set.contains(func_ptr)) {
+            vm_verifier.verifyFunction(allocator, func, functions, self.instantiated_functions, self.operand_stack.max_size) catch |verr| {
+                return switch (verr) {
+                    error.StackUnderflow => error.StackUnderflow,
+                    error.StackOverflow => error.StackOverflow,
+                    error.TypeMismatch => error.TypeMismatch,
+                    error.InvalidLocalIndex => error.InvalidLocal,
+                    error.InvalidBranchTarget => error.InvalidInstruction,
+                    error.InvalidFieldIndex => error.InvalidInstruction,
+                    error.InvalidFunctionIndex => error.FunctionNotFound,
+                    error.InvalidInstruction => error.InvalidInstruction,
+                    error.ExtraValueOnStack => error.InvalidInstruction,
+                    error.MissingReturn => error.MissingReturn,
+                    error.OutOfMemory => error.OutOfMemory,
+                };
             };
-        };
+            try self.verified_set.put(func_ptr, {});
+        }
 
         // Handle native entry functions directly
         if (func.is_native) {
+            if (args.len != func.param_count) return error.TypeMismatch;
             const native_registry = self.native_functions orelse return error.FunctionNotFound;
             const native_func = if (func.native_idx) |idx|
                 native_registry.lookupByIdx(idx) orelse return error.FunctionNotFound
@@ -268,7 +350,11 @@ pub const Interpreter = struct {
             return .{ .values = out, .gas_used = gas_meter.getUsed() };
         }
 
-        // Initialize locals from args
+        // Validate argument count
+        if (args.len != func.param_count) return error.TypeMismatch;
+
+        // Initialize locals from args (charge gas proportional to local count)
+        try gas_meter.consume(@as(u64, func.local_count));
         var locals = try Locals.new(allocator, func.local_count);
 
         for (args, 0..) |arg, i| {
@@ -279,11 +365,11 @@ pub const Interpreter = struct {
         try self.call_stack.append(allocator, initial_frame);
 
         const result = self.executeMain(allocator, functions, gas_meter) catch |err| {
-            // Clean up any remaining frames and operand stack values on error
+            // Clean up operand stack FIRST to decrement ref_counts, then free locals
+            self.operand_stack.clearAndDeinit(allocator);
             while (self.call_stack.pop()) |frame| {
                 frame.locals.deinit(allocator);
             }
-            self.operand_stack.clearAndDeinit(allocator);
             return err;
         };
 
@@ -306,21 +392,30 @@ pub const Interpreter = struct {
             switch (exit_code) {
                 .Return => {
                     const returned_frame = self.call_stack.pop().?;
-                    returned_frame.locals.deinit(allocator);
 
                     if (self.call_stack.items.len > 0) {
+                        // Intermediate return: deinit locals after caller consumes values
+                        returned_frame.locals.deinit(allocator);
                         // Return to caller: advance PC past the Call instruction
                         const caller = &self.call_stack.items[self.call_stack.items.len - 1];
                         caller.pc += 1;
                     } else {
-                        // End of execution
+                        // End of execution: pop return values BEFORE freeing locals
                         const return_count = returned_frame.function.return_count;
-                        const results = try allocator.alloc(Value, return_count);
-                        var i: usize = return_count;
-                        while (i > 0) {
-                            i -= 1;
-                            results[i] = try self.operand_stack.pop();
+                        var results = try allocator.alloc(Value, return_count);
+                        var popped: usize = 0;
+                        errdefer {
+                            var j: usize = 0;
+                            while (j < popped) : (j += 1) {
+                                results[j].deinit(allocator);
+                            }
+                            allocator.free(results);
                         }
+                        while (popped < return_count) {
+                            results[return_count - 1 - popped] = try self.operand_stack.pop();
+                            popped += 1;
+                        }
+                        returned_frame.locals.deinit(allocator);
                         return .{
                             .values = results,
                             .gas_used = gas_meter.getUsed(),
@@ -338,9 +433,17 @@ pub const Interpreter = struct {
                             if (func_idx >= caller_frame.function.function_handles.len) {
                                 return error.InvalidInstruction;
                             }
+
+                            // Use resolved_handles if available (set by Loader during module compilation)
+                            if (func_idx < caller_frame.function.resolved_handles.len) {
+                                if (caller_frame.function.resolved_handles[func_idx]) |r| {
+                                    break :blk r;
+                                }
+                            }
+
                             const handle = caller_frame.function.function_handles[func_idx];
 
-                            // Try loader first
+                            // Fallback: try loader
                             if (self.loader) |loader| {
                                 const resolved = try loader.resolveFunction(handle.module, handle.name);
                                 if (resolved) |r| break :blk r;
@@ -390,7 +493,9 @@ pub const Interpreter = struct {
                         }
                     } else {
                         // Pop arguments from operand stack (last arg is on top)
+                        try gas_meter.consume(@as(u64, callee.local_count));
                         var callee_locals = try Locals.new(allocator, callee.local_count);
+                        errdefer callee_locals.deinit(allocator);
                         var i: usize = callee.param_count;
                         while (i > 0) {
                             i -= 1;
@@ -399,6 +504,7 @@ pub const Interpreter = struct {
                         }
 
                         const new_frame = Frame.init(callee_locals, callee, &.{});
+                        errdefer new_frame.locals.deinit(allocator);
                         try self.call_stack.append(allocator, new_frame);
                     }
                 },
@@ -443,6 +549,7 @@ pub const Interpreter = struct {
                         }
                     } else {
                         var callee_locals = try Locals.new(allocator, callee.local_count);
+                        errdefer callee_locals.deinit(allocator);
                         var i: usize = callee.param_count;
                         while (i > 0) {
                             i -= 1;
@@ -451,6 +558,7 @@ pub const Interpreter = struct {
                         }
 
                         const new_frame = Frame.init(callee_locals, callee, &.{});
+                        errdefer new_frame.locals.deinit(allocator);
                         try self.call_stack.append(allocator, new_frame);
                     }
                 },
@@ -466,6 +574,7 @@ pub const Interpreter = struct {
         while (frame.pc < code.items.len) {
             const inst = code.items[frame.pc];
             try gas_meter.consume(instructionGasCost(inst));
+            try self.chargeDataSizeGas(inst, gas_meter);
 
             const instr_ret = try self.executeInstruction(allocator, frame, inst);
             switch (instr_ret) {
@@ -483,8 +592,11 @@ pub const Interpreter = struct {
             // Stack operations
             .pop => {
                 var val = try self.operand_stack.pop();
-                defer val.deinit(allocator);
-                if (!val.impl.canDrop()) return error.TypeMismatch;
+                if (!val.impl.canDrop()) {
+                    try self.operand_stack.push(allocator, val);
+                    return error.TypeMismatch;
+                }
+                val.deinit(allocator);
             },
             .ret => |r| {
                 if (r.num_vals != frame.function.return_count) return error.TypeMismatch;
@@ -562,6 +674,31 @@ pub const Interpreter = struct {
                 defer ref.deinit(allocator);
                 if (!val.canStore()) {
                     return error.TypeMismatch;
+                }
+                // Log change before writing to a borrowed global so rollback can restore it
+                const is_global_ref = switch (ref.impl) {
+                    .ContainerRef => |r| r.is_global,
+                    .IndexedRef => |r| r.container_ref.is_global,
+                    else => false,
+                };
+                if (is_global_ref) {
+                    const addr = switch (ref.impl) {
+                        .ContainerRef => |r| r.global_address,
+                        .IndexedRef => |r| r.container_ref.global_address,
+                        else => null,
+                    };
+                    const tk = switch (ref.impl) {
+                        .ContainerRef => |r| r.global_type_key,
+                        .IndexedRef => |r| r.container_ref.global_type_key,
+                        else => null,
+                    };
+                    if (addr) |a| {
+                        if (tk) |t| {
+                            if (self.storage) |store| {
+                                try store.logChange(a, t);
+                            }
+                        }
+                    }
                 }
                 try ref.write_ref(allocator, val);
             },
@@ -694,13 +831,16 @@ pub const Interpreter = struct {
             },
 
             // Pack/Unpack
-            .pack => |n| {
+            .pack => |def_idx| {
+                if (def_idx >= frame.function.struct_defs.len) return error.InvalidInstruction;
+                const def = &frame.function.struct_defs[def_idx];
+                const n = def.fields.items.len;
                 const fields = try self.operand_stack.popn(allocator, @intCast(n));
                 defer {
                     for (fields) |*field| field.deinit(allocator);
                     allocator.free(fields);
                 }
-                const s = try StructValue.pack(allocator, fields, .{ .can_copy = true, .can_drop = true, .can_store = true, .is_key = false });
+                const s = try StructValue.pack(allocator, fields, def.abilities);
                 try self.operand_stack.push(allocator, s);
             },
             .pack_generic => |type_inst| {
@@ -715,24 +855,32 @@ pub const Interpreter = struct {
             },
             .unpack => |n| {
                 var val = try self.operand_stack.pop();
-                defer val.deinit(allocator);
+                if (val.impl == .Container and val.impl.Container.ref_count > 0) return error.InvalidReference;
                 var unpacked = try StructValue.unpack(val, allocator);
-                defer unpacked.deinit(allocator);
+                defer {
+                    for (unpacked.items) |*item| item.deinit(allocator);
+                    unpacked.deinit(allocator);
+                }
                 if (unpacked.items.len != n) return error.TypeMismatch;
                 for (unpacked.items) |field| {
                     try self.operand_stack.push(allocator, field);
                 }
+                val.deinit(allocator);
             },
             .unpack_generic => |type_inst| {
                 const info = try Self.resolveGenericStruct(frame.function, type_inst);
                 var val = try self.operand_stack.pop();
-                defer val.deinit(allocator);
+                if (val.impl == .Container and val.impl.Container.ref_count > 0) return error.InvalidReference;
                 var unpacked = try StructValue.unpack(val, allocator);
-                defer unpacked.deinit(allocator);
+                defer {
+                    for (unpacked.items) |*item| item.deinit(allocator);
+                    unpacked.deinit(allocator);
+                }
                 if (unpacked.items.len != info.field_count) return error.TypeMismatch;
                 for (unpacked.items) |field| {
                     try self.operand_stack.push(allocator, field);
                 }
+                val.deinit(allocator);
             },
 
             // Cast
@@ -783,7 +931,8 @@ pub const Interpreter = struct {
             .abort => {
                 var v = try self.operand_stack.pop();
                 defer v.deinit(allocator);
-                _ = try IntegerValue.fromValue(v);
+                const int = try IntegerValue.fromValue(v);
+                self.last_abort_code = try int.cast_u64();
                 return VMError.Aborted;
             },
 
@@ -792,6 +941,7 @@ pub const Interpreter = struct {
 
             // Vector operations (simplified)
             .vec_pack => |vp| {
+                if (vp.num > std.math.maxInt(u16)) return error.InvalidInstruction;
                 const elems = try self.operand_stack.popn(allocator, @intCast(vp.num));
                 defer {
                     for (elems) |*elem| elem.deinit(allocator);
@@ -807,43 +957,54 @@ pub const Interpreter = struct {
                 try self.operand_stack.push(allocator, Value.makeU64(@intCast(len)));
             },
             .vec_push_back => {
-                const elem = try self.operand_stack.pop();
-                const vec_ref = try self.operand_stack.pop();
+                var elem = try self.operand_stack.pop();
+                defer elem.deinit(allocator);
+                var vec_ref = try self.operand_stack.pop();
+                defer vec_ref.deinit(allocator);
                 try VectorValue.push_back(vec_ref, allocator, elem);
             },
             .vec_pop_back => {
-                const vec_ref = try self.operand_stack.pop();
+                var vec_ref = try self.operand_stack.pop();
+                defer vec_ref.deinit(allocator);
                 const elem = try VectorValue.pop_back(vec_ref, allocator);
                 try self.operand_stack.push(allocator, elem);
             },
             .vec_swap => {
                 const idx2 = try self.operand_stack.popAs(u64);
                 const idx1 = try self.operand_stack.popAs(u64);
-                const vec_ref = try self.operand_stack.pop();
+                if (idx1 > std.math.maxInt(usize) or idx2 > std.math.maxInt(usize)) return error.IndexOutOfBounds;
+                var vec_ref = try self.operand_stack.pop();
+                defer vec_ref.deinit(allocator);
                 try VectorValue.swap(vec_ref, @intCast(idx1), @intCast(idx2));
             },
             .vec_imm_borrow => |type_idx| {
                 _ = type_idx;
                 const idx = try self.operand_stack.popAs(u64);
-                const vec_ref = try self.operand_stack.pop();
+                if (idx > std.math.maxInt(usize)) return error.IndexOutOfBounds;
+                var vec_ref = try self.operand_stack.pop();
+                defer vec_ref.deinit(allocator);
                 const ref = try vec_ref.borrow_elem(@intCast(idx));
                 try self.operand_stack.push(allocator, ref);
             },
             .vec_mut_borrow => |type_idx| {
                 _ = type_idx;
                 const idx = try self.operand_stack.popAs(u64);
-                const vec_ref = try self.operand_stack.pop();
+                if (idx > std.math.maxInt(usize)) return error.IndexOutOfBounds;
+                var vec_ref = try self.operand_stack.pop();
+                defer vec_ref.deinit(allocator);
                 const ref = try vec_ref.borrow_elem(@intCast(idx));
                 try self.operand_stack.push(allocator, ref);
             },
             .vec_unpack => |vu| {
+                if (vu.num > std.math.maxInt(usize)) return error.InvalidInstruction;
                 var vec = try self.operand_stack.pop();
-                defer vec.deinit(allocator);
+                if (vec.impl == .Container and vec.impl.Container.ref_count > 0) return error.InvalidReference;
                 var elems = try VectorValue.unpack(vec, allocator, @intCast(vu.num));
                 defer elems.deinit(allocator);
                 for (elems.items) |elem| {
                     try self.operand_stack.push(allocator, elem);
                 }
+                vec.deinit(allocator);
             },
 
             // Field borrowing
@@ -863,8 +1024,8 @@ pub const Interpreter = struct {
             .move_to => |mt| {
                 const store = self.storage orelse return error.MissingStorage;
                 var resource = try self.operand_stack.pop();
+                defer resource.deinit(allocator);
                 if (!resource.isKey()) {
-                    resource.deinit(allocator);
                     return error.InvalidResource;
                 }
                 var signer = try self.operand_stack.pop();
@@ -878,8 +1039,8 @@ pub const Interpreter = struct {
                 defer allocator.free(addr_key);
                 const type_key = try std.fmt.allocPrint(allocator, "type_{}", .{mt.type_});
                 defer allocator.free(type_key);
-                const resource_copy = try resource.copy_value(allocator);
-                resource.deinit(allocator);
+                var resource_copy = try resource.copy_value(allocator);
+                errdefer resource_copy.deinit(allocator);
                 try store.setGlobal(addr_key, type_key, resource_copy);
             },
             .move_from => |mf| {
@@ -927,16 +1088,23 @@ pub const Interpreter = struct {
                 defer allocator.free(addr_key);
                 const type_key = try std.fmt.allocPrint(allocator, "type_{}", .{bg.type_});
                 defer allocator.free(type_key);
-                const stored = (try store.getGlobal(addr_key, type_key)) orelse return error.InvalidReference;
+                const stored = (try store.getGlobalPtr(addr_key, type_key)) orelse return error.InvalidReference;
                 const container = switch (stored.impl) {
                     .Container => |c| c,
                     else => return error.TypeMismatch,
                 };
+                container.ref_count += 1;
+                const addr_copy = try allocator.dupe(u8, addr_key);
+                errdefer allocator.free(addr_copy);
+                const type_copy = try allocator.dupe(u8, type_key);
+                errdefer allocator.free(type_copy);
                 try self.operand_stack.push(allocator, Value.init(.{ .ContainerRef = .{
                     .container = container,
                     .is_mutable = true,
                     .is_global = true,
                     .global_status = null,
+                    .global_address = addr_copy,
+                    .global_type_key = type_copy,
                 } }));
             },
             .imm_borrow_global => |bg| {
@@ -952,24 +1120,31 @@ pub const Interpreter = struct {
                 defer allocator.free(addr_key);
                 const type_key = try std.fmt.allocPrint(allocator, "type_{}", .{bg.type_});
                 defer allocator.free(type_key);
-                const stored = (try store.getGlobal(addr_key, type_key)) orelse return error.InvalidReference;
+                const stored = (try store.getGlobalPtr(addr_key, type_key)) orelse return error.InvalidReference;
                 const container = switch (stored.impl) {
                     .Container => |c| c,
                     else => return error.TypeMismatch,
                 };
+                container.ref_count += 1;
+                const addr_copy = try allocator.dupe(u8, addr_key);
+                errdefer allocator.free(addr_copy);
+                const type_copy = try allocator.dupe(u8, type_key);
+                errdefer allocator.free(type_copy);
                 try self.operand_stack.push(allocator, Value.init(.{ .ContainerRef = .{
                     .container = container,
                     .is_mutable = false,
                     .is_global = true,
                     .global_status = null,
+                    .global_address = addr_copy,
+                    .global_type_key = type_copy,
                 } }));
             },
             .move_to_generic => |mt| {
                 const store = self.storage orelse return error.MissingStorage;
                 var resource = try self.operand_stack.pop();
+                defer resource.deinit(allocator);
                 const info = try Self.resolveGenericStruct(frame.function, mt.type_instantiation);
                 if (!info.abilities.is_key) {
-                    resource.deinit(allocator);
                     return error.InvalidResource;
                 }
                 var signer = try self.operand_stack.pop();
@@ -984,7 +1159,6 @@ pub const Interpreter = struct {
                 const type_key = try std.fmt.allocPrint(allocator, "type_{}", .{mt.type_instantiation});
                 defer allocator.free(type_key);
                 const resource_copy = try resource.copy_value(allocator);
-                resource.deinit(allocator);
                 try store.setGlobal(addr_key, type_key, resource_copy);
             },
             .move_from_generic => |mf| {
@@ -1032,11 +1206,12 @@ pub const Interpreter = struct {
                 defer allocator.free(addr_key);
                 const type_key = try std.fmt.allocPrint(allocator, "type_{}", .{bg.type_instantiation});
                 defer allocator.free(type_key);
-                const stored = (try store.getGlobal(addr_key, type_key)) orelse return error.InvalidReference;
+                const stored = (try store.getGlobalPtr(addr_key, type_key)) orelse return error.InvalidReference;
                 const container = switch (stored.impl) {
                     .Container => |c| c,
                     else => return error.TypeMismatch,
                 };
+                container.ref_count += 1;
                 try self.operand_stack.push(allocator, Value.init(.{ .ContainerRef = .{
                     .container = container,
                     .is_mutable = true,
@@ -1057,11 +1232,12 @@ pub const Interpreter = struct {
                 defer allocator.free(addr_key);
                 const type_key = try std.fmt.allocPrint(allocator, "type_{}", .{bg.type_instantiation});
                 defer allocator.free(type_key);
-                const stored = (try store.getGlobal(addr_key, type_key)) orelse return error.InvalidReference;
+                const stored = (try store.getGlobalPtr(addr_key, type_key)) orelse return error.InvalidReference;
                 const container = switch (stored.impl) {
                     .Container => |c| c,
                     else => return error.TypeMismatch,
                 };
+                container.ref_count += 1;
                 try self.operand_stack.push(allocator, Value.init(.{ .ContainerRef = .{
                     .container = container,
                     .is_mutable = false,

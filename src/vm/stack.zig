@@ -72,6 +72,10 @@ pub const Stack = struct {
         for (0..n) |i| {
             result[i] = self.values.items[start + i];
         }
+        // Deinitialize the original stack slots before shrinking
+        for (self.values.items[start..]) |*val| {
+            val.deinit(allocator);
+        }
         self.values.shrinkRetainingCapacity(start);
         return result;
     }
@@ -102,16 +106,23 @@ pub const Stack = struct {
     }
 
     /// Clear the stack and deinitialize all values (for error cleanup).
+    /// Iterates top-down so references are dropped before their targets.
     pub fn clearAndDeinit(self: *Stack, allocator: std.mem.Allocator) void {
-        for (self.values.items) |*val| {
-            val.deinit(allocator);
+        var i: usize = self.values.items.len;
+        while (i > 0) {
+            i -= 1;
+            self.values.items[i].deinit(allocator);
         }
         self.values.clearRetainingCapacity();
     }
 
+    /// Deinitialize all values and free the stack buffer.
+    /// Iterates top-down so references are dropped before their targets.
     pub fn deinit(self: *Stack, allocator: std.mem.Allocator) void {
-        for (self.values.items) |*val| {
-            val.deinit(allocator);
+        var i: usize = self.values.items.len;
+        while (i > 0) {
+            i -= 1;
+            self.values.items[i].deinit(allocator);
         }
         self.values.deinit(allocator);
     }

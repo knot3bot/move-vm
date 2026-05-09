@@ -109,6 +109,7 @@ pub fn main() !void {
 
     try store.setGlobal("0x1", "Coin", Value.makeU64(1000));
     if (try store.getGlobal("0x1", "Coin")) |val| {
+        defer val.deinit(allocator);
         std.debug.print("Stored Coin value: {}\n", .{val.impl.U64});
     }
     std.debug.print("Exists check: {}\n\n", .{store.exists("0x1", "Coin")});

@@ -66,6 +66,7 @@ pub const Locals = struct {
         switch (v) {
             .Invalid => return error.InvalidLocal,
             .Container => |c| {
+                c.ref_count += 1;
                 return Value.init(.{ .ContainerRef = .{
                     .container = c,
                     .is_mutable = is_mutable,
@@ -74,6 +75,7 @@ pub const Locals = struct {
                 } });
             },
             else => {
+                self.container.ref_count += 1;
                 return Value.init(.{ .IndexedRef = .{
                     .container_ref = .{
                         .container = self.container,
@@ -128,7 +130,9 @@ test "Locals basic operations" {
 
     // Borrow
     try locals.store_loc(allocator, 2, Value.makeU64(100));
-    const borrowed = try locals.borrow_loc(2, true);
-    const read = try borrowed.read_ref(allocator);
+    var borrowed = try locals.borrow_loc(2, true);
+    defer borrowed.deinit(allocator);
+    var read = try borrowed.read_ref(allocator);
+    defer read.deinit(allocator);
     try std.testing.expect(try read.equals(Value.makeU64(100)));
 }

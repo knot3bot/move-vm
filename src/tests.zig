@@ -307,10 +307,21 @@ test "execute fibonacci(10)" {
 test "execute struct pack and unpack" {
     const allocator = std.testing.allocator;
 
+    var fields = std.ArrayList(vm_module.FieldDef).empty;
+    try fields.append(allocator, .{ .name = "f0", .type_signature = .U64 });
+    try fields.append(allocator, .{ .name = "f1", .type_signature = .U64 });
+    var struct_def = vm_module.StructDef{
+        .name = "TestStruct",
+        .type_params = &.{},
+        .fields = fields,
+        .abilities = vm_types.AbilitySet.default(),
+    };
+    defer struct_def.fields.deinit(allocator);
+
     var func = try buildFunc(allocator, "test_struct", 0, 1, 1, &.{
         Instruction{ .ld_u64 = 42 },
         Instruction{ .ld_u64 = 100 },
-        Instruction{ .pack = 2 },
+        Instruction{ .pack = 0 },
         Instruction{ .unpack = 2 },
         Instruction{ .pop = {} },
         Instruction{ .st_loc = 0 },
@@ -318,6 +329,7 @@ test "execute struct pack and unpack" {
         Instruction{ .ret = .{ .num_vals = 1 } },
     });
     defer func.deinit(allocator);
+    func.struct_defs = &.{struct_def};
 
     var gas_meter = Gas.init(10000);
     var interp = Interpreter.init(allocator);
@@ -446,6 +458,85 @@ test "execute shl and shr" {
     try std.testing.expectEqual(@as(usize, 2), result.values.len);
     try std.testing.expectEqual(@as(u64, 16), result.values[0].impl.U64); // 1 << 4
     try std.testing.expectEqual(@as(u64, 4), result.values[1].impl.U64); // 16 >> 2
+}
+
+test "execute shl overflow on large shift" {
+    const allocator = std.testing.allocator;
+
+    var func = try buildFunc(allocator, "shl_overflow", 0, 0, 1, &.{
+        Instruction{ .ld_u64 = 1 },
+        Instruction{ .ld_u64 = 64 }, // shift by 64 on u64 is invalid
+        Instruction{ .shl = {} },
+        Instruction{ .ret = .{ .num_vals = 1 } },
+    });
+    defer func.deinit(allocator);
+
+    var gas_meter = Gas.init(10000);
+    var interp = Interpreter.init(allocator);
+    defer interp.deinit(allocator);
+
+    const result = interp.executeFunction(allocator, &func, &.{}, &.{}, &.{}, &gas_meter);
+    try std.testing.expectError(error.Overflow, result);
+}
+
+test "execute cast overflow" {
+    const allocator = std.testing.allocator;
+
+    var func = try buildFunc(allocator, "cast_overflow", 0, 0, 1, &.{
+        Instruction{ .ld_u64 = 300 },
+        Instruction{ .cast_u8 = {} },
+        Instruction{ .ret = .{ .num_vals = 1 } },
+    });
+    defer func.deinit(allocator);
+
+    var gas_meter = Gas.init(10000);
+    var interp = Interpreter.init(allocator);
+    defer interp.deinit(allocator);
+
+    const result = interp.executeFunction(allocator, &func, &.{}, &.{}, &.{}, &gas_meter);
+    try std.testing.expectError(error.Overflow, result);
+}
+
+test "execute vector index out of bounds" {
+    const allocator = std.testing.allocator;
+
+    var func = try buildFunc(allocator, "vec_oob", 0, 1, 1, &.{
+        Instruction{ .ld_u64 = 10 },
+        Instruction{ .ld_u64 = 20 },
+        Instruction{ .vec_pack = .{ .type_ = 0, .num = 2 } },
+        Instruction{ .st_loc = 0 },
+        Instruction{ .mut_borrow_loc = 0 },
+        Instruction{ .ld_u64 = 99 }, // index 99 out of bounds
+        Instruction{ .vec_mut_borrow = 0 },
+        Instruction{ .ret = .{ .num_vals = 1 } },
+    });
+    defer func.deinit(allocator);
+
+    var gas_meter = Gas.init(10000);
+    var interp = Interpreter.init(allocator);
+    defer interp.deinit(allocator);
+
+    const result = interp.executeFunction(allocator, &func, &.{}, &.{}, &.{}, &gas_meter);
+    try std.testing.expectError(error.IndexOutOfBounds, result);
+}
+
+test "execute abort with code" {
+    const allocator = std.testing.allocator;
+
+    var func = try buildFunc(allocator, "abort_test", 0, 0, 0, &.{
+        Instruction{ .ld_u64 = 42 },
+        Instruction{ .abort = {} },
+        Instruction{ .ret = .{ .num_vals = 0 } },
+    });
+    defer func.deinit(allocator);
+
+    var gas_meter = Gas.init(10000);
+    var interp = Interpreter.init(allocator);
+    defer interp.deinit(allocator);
+
+    const result = interp.executeFunction(allocator, &func, &.{}, &.{}, &.{}, &gas_meter);
+    try std.testing.expectError(error.Aborted, result);
+    try std.testing.expectEqual(@as(u64, 42), interp.last_abort_code);
 }
 
 test "execute not" {
@@ -683,11 +774,22 @@ test "execute boolean logic" {
 test "execute field borrow and write" {
     const allocator = std.testing.allocator;
 
+    var fields = std.ArrayList(vm_module.FieldDef).empty;
+    try fields.append(allocator, .{ .name = "f0", .type_signature = .U64 });
+    try fields.append(allocator, .{ .name = "f1", .type_signature = .U64 });
+    var struct_def = vm_module.StructDef{
+        .name = "TestStruct",
+        .type_params = &.{},
+        .fields = fields,
+        .abilities = vm_types.AbilitySet.default(),
+    };
+    defer struct_def.fields.deinit(allocator);
+
     var func = try buildFunc(allocator, "field_borrow", 0, 2, 1, &.{
         // local[0] = Struct(42, 100)
         Instruction{ .ld_u64 = 42 },
         Instruction{ .ld_u64 = 100 },
-        Instruction{ .pack = 2 },
+        Instruction{ .pack = 0 },
         Instruction{ .st_loc = 0 },
 
         // local[1] = &local[0].field0
@@ -700,6 +802,10 @@ test "execute field borrow and write" {
         Instruction{ .ld_u64 = 99 },
         Instruction{ .write_ref = {} },
 
+        // clear borrow reference before consuming the struct
+        Instruction{ .ld_u64 = 0 },
+        Instruction{ .st_loc = 1 },
+
         // return local[0].field0 via unpack (use move_loc since struct is resource)
         Instruction{ .move_loc = 0 },
         Instruction{ .unpack = 2 },
@@ -707,6 +813,7 @@ test "execute field borrow and write" {
         Instruction{ .ret = .{ .num_vals = 1 } },
     });
     defer func.deinit(allocator);
+    func.struct_defs = &.{struct_def};
 
     var gas_meter = Gas.init(10000);
     var interp = Interpreter.init(allocator);
@@ -740,6 +847,10 @@ test "execute vector element borrow" {
         Instruction{ .copy_loc = 1 },
         Instruction{ .ld_u64 = 99 },
         Instruction{ .write_ref = {} },
+
+        // clear borrow reference before reading from vector
+        Instruction{ .ld_u64 = 0 },
+        Instruction{ .st_loc = 1 },
 
         // return local[0][1]
         Instruction{ .mut_borrow_loc = 0 },
@@ -872,6 +983,10 @@ test "execute global storage borrow_global and move_from" {
         Instruction{ .mut_borrow_field = 0 },
         Instruction{ .ld_u64 = 99 },
         Instruction{ .write_ref = {} },
+
+        // clear borrow reference before move_from
+        Instruction{ .ld_u64 = 0 },
+        Instruction{ .st_loc = 1 },
 
         // move_from and return
         Instruction{ .copy_loc = 0 },
@@ -1748,6 +1863,10 @@ test "mut_borrow_field_generic" {
         Instruction{ .ld_u64 = 99 },
         Instruction{ .write_ref = {} },
 
+        // clear borrow reference before consuming the struct
+        Instruction{ .ld_u64 = 0 },
+        Instruction{ .st_loc = 1 },
+
         // return local[0].field0
         Instruction{ .move_loc = 0 },
         Instruction{ .unpack_generic = 0 },
@@ -2099,15 +2218,26 @@ test "store_loc rejects overwriting non-droppable value" {
 test "write_ref rejects non-storable value" {
     const allocator = std.testing.allocator;
 
+    var fields = std.ArrayList(vm_module.FieldDef).empty;
+    try fields.append(allocator, .{ .name = "value", .type_signature = .U64 });
+    var struct_def = vm_module.StructDef{
+        .name = "NonStorable",
+        .type_params = &.{},
+        .fields = fields,
+        .abilities = .{ .can_copy = true, .can_drop = true, .can_store = false, .is_key = false },
+    };
+    defer struct_def.fields.deinit(allocator);
+
     var func = Function.init(allocator, "test");
     defer func.deinit(allocator);
     func.param_count = 0;
     func.local_count = 2;
     func.return_count = 0;
+    func.struct_defs = &.{struct_def};
 
-    // local[0] = Struct(42) - mutable
+    // local[0] = Struct(42)
     try func.code.push(allocator, Instruction{ .ld_u64 = 42 });
-    try func.code.push(allocator, Instruction{ .pack = 1 });
+    try func.code.push(allocator, Instruction{ .pack = 0 });
     try func.code.push(allocator, Instruction{ .st_loc = 0 });
 
     // local[1] = &local[0]
@@ -2116,7 +2246,7 @@ test "write_ref rejects non-storable value" {
 
     // *local[1] = non-storable Struct(99)
     try func.code.push(allocator, Instruction{ .ld_u64 = 99 });
-    try func.code.push(allocator, Instruction{ .pack = 1 });
+    try func.code.push(allocator, Instruction{ .pack = 0 });
     try func.code.push(allocator, Instruction{ .copy_loc = 1 });
     try func.code.push(allocator, Instruction{ .write_ref = {} });
     try func.code.push(allocator, Instruction{ .ret = .{ .num_vals = 0 } });
@@ -2231,17 +2361,28 @@ test "verifier detects extra value on stack at return" {
 test "verifier detects write_ref on immutable reference" {
     const allocator = std.testing.allocator;
 
+    var fields = std.ArrayList(vm_module.FieldDef).empty;
+    try fields.append(allocator, .{ .name = "value", .type_signature = .U64 });
+    var struct_def = vm_module.StructDef{
+        .name = "TestStruct",
+        .type_params = &.{},
+        .fields = fields,
+        .abilities = vm_types.AbilitySet.default(),
+    };
+    defer struct_def.fields.deinit(allocator);
+
     var func = try buildFunc(allocator, "bad_write", 0, 1, 0, &.{
         Instruction{ .ld_u64 = 42 },
-        Instruction{ .pack = 1 },
+        Instruction{ .pack = 0 },
         Instruction{ .st_loc = 0 },
         Instruction{ .imm_borrow_loc = 0 },
         Instruction{ .ld_u64 = 99 },
-        Instruction{ .pack = 1 },
+        Instruction{ .pack = 0 },
         Instruction{ .write_ref = {} },
         Instruction{ .ret = .{ .num_vals = 0 } },
     });
     defer func.deinit(allocator);
+    func.struct_defs = &.{struct_def};
 
     const result = vm_verifier.verifyFunction(allocator, &func, &.{}, &.{}, 1024);
     try std.testing.expectError(error.TypeMismatch, result);
@@ -2250,15 +2391,26 @@ test "verifier detects write_ref on immutable reference" {
 test "verifier detects freeze_ref on non-mutable reference" {
     const allocator = std.testing.allocator;
 
+    var fields = std.ArrayList(vm_module.FieldDef).empty;
+    try fields.append(allocator, .{ .name = "value", .type_signature = .U64 });
+    var struct_def = vm_module.StructDef{
+        .name = "TestStruct",
+        .type_params = &.{},
+        .fields = fields,
+        .abilities = vm_types.AbilitySet.default(),
+    };
+    defer struct_def.fields.deinit(allocator);
+
     var func = try buildFunc(allocator, "bad_freeze", 0, 1, 0, &.{
         Instruction{ .ld_u64 = 42 },
-        Instruction{ .pack = 1 },
+        Instruction{ .pack = 0 },
         Instruction{ .st_loc = 0 },
         Instruction{ .imm_borrow_loc = 0 },
         Instruction{ .freeze_ref = {} },
         Instruction{ .ret = .{ .num_vals = 0 } },
     });
     defer func.deinit(allocator);
+    func.struct_defs = &.{struct_def};
 
     const result = vm_verifier.verifyFunction(allocator, &func, &.{}, &.{}, 1024);
     try std.testing.expectError(error.TypeMismatch, result);
@@ -2306,6 +2458,135 @@ test "verifier detects ret num_vals mismatch" {
 
     const result = vm_verifier.verifyFunction(allocator, &func, &.{}, &.{}, 1024);
     try std.testing.expectError(error.TypeMismatch, result);
+}
+
+test "verifier detects pack field type mismatch" {
+    const allocator = std.testing.allocator;
+
+    var fields = std.ArrayList(vm_module.FieldDef).empty;
+    try fields.append(allocator, .{ .name = "x", .type_signature = .U64 });
+    try fields.append(allocator, .{ .name = "y", .type_signature = .U8 });
+    var struct_def = vm_module.StructDef{
+        .name = "Point",
+        .type_params = &.{},
+        .fields = fields,
+        .abilities = vm_types.AbilitySet.default(),
+    };
+    defer struct_def.fields.deinit(allocator);
+
+    // Push U64 then U64 (should be U64 then U8)
+    var func = try buildFunc(allocator, "bad_pack", 0, 0, 0, &.{
+        Instruction{ .ld_u64 = 1 },
+        Instruction{ .ld_u64 = 2 },
+        Instruction{ .pack = 0 },
+        Instruction{ .pop = {} },
+        Instruction{ .ret = .{ .num_vals = 0 } },
+    });
+    defer func.deinit(allocator);
+    func.struct_defs = &.{struct_def};
+
+    const result = vm_verifier.verifyFunction(allocator, &func, &.{}, &.{}, 1024);
+    try std.testing.expectError(error.TypeMismatch, result);
+}
+
+test "verifier detects pack_generic field type mismatch" {
+    const allocator = std.testing.allocator;
+
+    var fields = std.ArrayList(vm_module.FieldDef).empty;
+    try fields.append(allocator, .{ .name = "value", .type_signature = .{ .TypeParameter = 0 } });
+    var struct_def = vm_module.StructDef{
+        .name = "Box",
+        .type_params = &.{},
+        .fields = fields,
+        .abilities = vm_types.AbilitySet.default(),
+    };
+    defer struct_def.fields.deinit(allocator);
+
+    var type_sigs = std.ArrayList(vm_module.TypeSignature).empty;
+    try type_sigs.append(allocator, .U64);
+    defer type_sigs.deinit(allocator);
+
+    const struct_inst = vm_module.StructDefInstantiation{
+        .def = 0,
+        .type_args = &.{0}, // resolves TypeParameter 0 -> U64
+    };
+
+    var resolved_field_types = std.ArrayList(vm_types.ResolvedStructFieldTypes).empty;
+    var ft = try allocator.alloc(vm_types.Type, 1);
+    ft[0] = .U64;
+    try resolved_field_types.append(allocator, .{ .field_types = ft });
+    defer {
+        allocator.free(ft);
+        resolved_field_types.deinit(allocator);
+    }
+
+    // Push U8 instead of U64 for the generic field
+    var func = try buildFunc(allocator, "bad_pack_gen", 0, 0, 0, &.{
+        Instruction{ .ld_u8 = 42 },
+        Instruction{ .pack_generic = 0 },
+        Instruction{ .pop = {} },
+        Instruction{ .ret = .{ .num_vals = 0 } },
+    });
+    defer func.deinit(allocator);
+    func.struct_defs = &.{struct_def};
+    func.type_signatures = type_sigs.items;
+    func.struct_instantiations = &.{struct_inst};
+    func.resolved_struct_field_types = resolved_field_types.items;
+
+    const result = vm_verifier.verifyFunction(allocator, &func, &.{}, &.{}, 1024);
+    try std.testing.expectError(error.TypeMismatch, result);
+}
+
+test "verifier unpack_generic pushes correct field types" {
+    const allocator = std.testing.allocator;
+
+    var fields = std.ArrayList(vm_module.FieldDef).empty;
+    try fields.append(allocator, .{ .name = "x", .type_signature = .{ .TypeParameter = 0 } });
+    try fields.append(allocator, .{ .name = "y", .type_signature = .{ .TypeParameter = 0 } });
+    var struct_def = vm_module.StructDef{
+        .name = "Pair",
+        .type_params = &.{},
+        .fields = fields,
+        .abilities = vm_types.AbilitySet.default(),
+    };
+    defer struct_def.fields.deinit(allocator);
+
+    var type_sigs = std.ArrayList(vm_module.TypeSignature).empty;
+    try type_sigs.append(allocator, .U32);
+    defer type_sigs.deinit(allocator);
+
+    const struct_inst = vm_module.StructDefInstantiation{
+        .def = 0,
+        .type_args = &.{0}, // resolves TypeParameter 0 -> U32
+    };
+
+    var resolved_field_types = std.ArrayList(vm_types.ResolvedStructFieldTypes).empty;
+    var ft = try allocator.alloc(vm_types.Type, 2);
+    ft[0] = .U32;
+    ft[1] = .U32;
+    try resolved_field_types.append(allocator, .{ .field_types = ft });
+    defer {
+        allocator.free(ft);
+        resolved_field_types.deinit(allocator);
+    }
+
+    // pack_generic (U32, U32) -> unpack_generic -> add (U32 + U32) -> ret
+    var func = try buildFunc(allocator, "unpack_gen_types", 0, 0, 1, &.{
+        Instruction{ .ld_u32 = 10 },
+        Instruction{ .ld_u32 = 20 },
+        Instruction{ .pack_generic = 0 },
+        Instruction{ .unpack_generic = 0 },
+        Instruction{ .add = {} },
+        Instruction{ .ret = .{ .num_vals = 1 } },
+    });
+    defer func.deinit(allocator);
+    func.struct_defs = &.{struct_def};
+    func.type_signatures = type_sigs.items;
+    func.struct_instantiations = &.{struct_inst};
+    func.resolved_struct_field_types = resolved_field_types.items;
+    try func.return_types.append(allocator, .U32);
+
+    try vm_verifier.verifyFunction(allocator, &func, &.{}, &.{}, 1024);
 }
 
 test "verifier detects ld_const out of bounds" {
@@ -2758,4 +3039,233 @@ test "ld_const rejects out of bounds index" {
 
     const result = interp.executeFunction(allocator, &func, &.{}, &.{}, &.{}, &gas_meter);
     try std.testing.expectError(error.InvalidInstruction, result);
+}
+
+test "ld_const all integer types" {
+    const allocator = std.testing.allocator;
+
+    var u8_data = try allocator.alloc(u8, 1);
+    u8_data[0] = 0xAB;
+    defer allocator.free(u8_data);
+    var u16_data = try allocator.alloc(u8, 2);
+    std.mem.writeInt(u16, u16_data[0..2], 0x1234, .little);
+    defer allocator.free(u16_data);
+    var u32_data = try allocator.alloc(u8, 4);
+    std.mem.writeInt(u32, u32_data[0..4], 0xDEADBEEF, .little);
+    defer allocator.free(u32_data);
+    var u64_data = try allocator.alloc(u8, 8);
+    std.mem.writeInt(u64, u64_data[0..8], 0x0102030405060708, .little);
+    defer allocator.free(u64_data);
+    var u128_data = try allocator.alloc(u8, 16);
+    std.mem.writeInt(u128, u128_data[0..16], 0xAABBCCDDEEFF00112233445566778899, .little);
+    defer allocator.free(u128_data);
+    var u256_data = try allocator.alloc(u8, 32);
+    std.mem.writeInt(u256, u256_data[0..32], 0x11223344556677889900AABBCCDDEEFF11223344556677889900AABBCCDDEEFF, .little);
+    defer allocator.free(u256_data);
+
+    const constants = &.{
+        vm_module.Constant{ .type_signature = .U8, .data = u8_data },
+        vm_module.Constant{ .type_signature = .U16, .data = u16_data },
+        vm_module.Constant{ .type_signature = .U32, .data = u32_data },
+        vm_module.Constant{ .type_signature = .U64, .data = u64_data },
+        vm_module.Constant{ .type_signature = .U128, .data = u128_data },
+        vm_module.Constant{ .type_signature = .U256, .data = u256_data },
+    };
+
+    var func = Function.init(allocator, "all_ints");
+    defer func.deinit(allocator);
+    func.param_count = 0;
+    func.local_count = 0;
+    func.return_count = 0;
+    func.constants = constants;
+
+    try func.code.push(allocator, Instruction{ .ld_const = .{ .const_idx = 0 } });
+    try func.code.push(allocator, Instruction{ .ld_const = .{ .const_idx = 1 } });
+    try func.code.push(allocator, Instruction{ .ld_const = .{ .const_idx = 2 } });
+    try func.code.push(allocator, Instruction{ .ld_const = .{ .const_idx = 3 } });
+    try func.code.push(allocator, Instruction{ .ld_const = .{ .const_idx = 4 } });
+    try func.code.push(allocator, Instruction{ .ld_const = .{ .const_idx = 5 } });
+    try func.code.push(allocator, Instruction{ .pop = {} });
+    try func.code.push(allocator, Instruction{ .pop = {} });
+    try func.code.push(allocator, Instruction{ .pop = {} });
+    try func.code.push(allocator, Instruction{ .pop = {} });
+    try func.code.push(allocator, Instruction{ .pop = {} });
+    try func.code.push(allocator, Instruction{ .pop = {} });
+    try func.code.push(allocator, Instruction{ .ret = .{ .num_vals = 0 } });
+
+    var gas_meter = Gas.init(10000);
+    var interp = Interpreter.init(allocator);
+    defer interp.deinit(allocator);
+
+    const result = try interp.executeFunction(allocator, &func, &.{}, &.{}, &.{}, &gas_meter);
+    defer result.deinit(allocator);
+}
+
+test "ld_const verifier type mismatch" {
+    const allocator = std.testing.allocator;
+
+    // Constant 0: U64, Constant 1: U8
+    var u64_data = try allocator.alloc(u8, 8);
+    std.mem.writeInt(u64, u64_data[0..8], 42, .little);
+    defer allocator.free(u64_data);
+    var u8_data = try allocator.alloc(u8, 1);
+    u8_data[0] = 7;
+    defer allocator.free(u8_data);
+
+    const constants = &.{
+        vm_module.Constant{ .type_signature = .U64, .data = u64_data },
+        vm_module.Constant{ .type_signature = .U8, .data = u8_data },
+    };
+
+    var func = Function.init(allocator, "type_mismatch");
+    defer func.deinit(allocator);
+    func.param_count = 0;
+    func.local_count = 0;
+    func.return_count = 0;
+    func.constants = constants;
+
+    try func.code.push(allocator, Instruction{ .ld_const = .{ .const_idx = 0 } });
+    try func.code.push(allocator, Instruction{ .ld_const = .{ .const_idx = 1 } });
+    try func.code.push(allocator, Instruction{ .add = {} });
+    try func.code.push(allocator, Instruction{ .pop = {} });
+    try func.code.push(allocator, Instruction{ .ret = .{ .num_vals = 0 } });
+
+    var gas_meter = Gas.init(10000);
+    var interp = Interpreter.init(allocator);
+    defer interp.deinit(allocator);
+
+    const result = interp.executeFunction(allocator, &func, &.{}, &.{}, &.{}, &gas_meter);
+    try std.testing.expectError(error.TypeMismatch, result);
+}
+
+
+test "generic type parameter replacement in struct field signatures" {
+    const allocator = std.testing.allocator;
+
+    var module = vm_module.Module.init(allocator);
+    defer module.deinit(allocator);
+
+    module.id = .{
+        .address = [_]u8{0} ** 31 ++ [_]u8{1},
+        .name = "GenericBoxModule",
+    };
+
+    // Type signature 0: U64
+    try module.type_signatures.append(allocator, .U64);
+
+    // Struct def 0: Box<T> { value: T }
+    var box_fields = std.ArrayList(vm_module.FieldDef).empty;
+    try box_fields.append(allocator, .{ .name = "value", .type_signature = .{ .TypeParameter = 0 } });
+
+    try module.struct_defs.append(allocator, .{
+        .name = "Box",
+        .type_params = &.{},
+        .fields = box_fields,
+        .abilities = vm_types.AbilitySet.default(),
+    });
+
+    // Struct instantiation 0: Box<U64> (type_args[0] = 0 -> U64)
+    try module.struct_instantiations.append(allocator, .{
+        .def = 0,
+        .type_args = &[_]u16{0},
+    });
+
+    // Function handle 0: main
+    try module.functions.append(allocator, .{
+        .module = module.id,
+        .name = "main",
+        .param_types = &.{},
+        .return_types = &.{},
+        .is_native = false,
+    });
+
+    var code = Bytecode.init(allocator);
+    try code.push(allocator, Instruction{ .ld_u64 = 42 });
+    try code.push(allocator, Instruction{ .pack_generic = 0 });
+    try code.push(allocator, Instruction{ .pop = {} });
+    try code.push(allocator, Instruction{ .ret = .{ .num_vals = 0 } });
+
+    try module.function_defs.append(allocator, .{
+        .handle = 0,
+        .visibility = .Public,
+        .type_params = &.{},
+        .params = 0,
+        .returns = 0,
+        .local_count = 0,
+        .code = code,
+        .is_native = false,
+    });
+
+    var loader = vm_loader.Loader.init(allocator);
+    defer loader.deinit();
+
+    try loader.loadModule(&module);
+
+    // Verify resolved_struct_field_types was computed correctly
+    const compiled = loader.compiled_modules.get("0x0000000000000000000000000000000000000000000000000000000000000001::GenericBoxModule").?;
+    try std.testing.expectEqual(@as(usize, 1), compiled.resolved_struct_field_types.len);
+    try std.testing.expectEqual(@as(usize, 1), compiled.resolved_struct_field_types[0].field_types.len);
+    try std.testing.expectEqual(vm_types.Type.U64, compiled.resolved_struct_field_types[0].field_types[0]);
+
+    // Also verify through resolveGenericStruct at runtime
+    const main_func = (try loader.getFunctionByName(module.id, "main")).?;
+    const info = try vm_interpreter.Interpreter.resolveGenericStruct(main_func, 0);
+    try std.testing.expectEqual(@as(u16, 1), info.field_count);
+    try std.testing.expectEqual(@as(usize, 1), info.field_types.len);
+    try std.testing.expectEqual(vm_types.Type.U64, info.field_types[0]);
+}
+
+
+test "integer arithmetic rejects mismatched type tags at runtime" {
+    // Direct IntegerValue call: U64 + U32 should fail with TypeMismatch
+    const a = vm_values.IntegerValue{ .U64 = 10 };
+    const b = vm_values.IntegerValue{ .U32 = 5 };
+
+    const add_result = vm_values.IntegerValue.add_checked(a, b);
+    try std.testing.expectError(error.TypeMismatch, add_result);
+
+    const sub_result = vm_values.IntegerValue.sub_checked(a, b);
+    try std.testing.expectError(error.TypeMismatch, sub_result);
+
+    const mul_result = vm_values.IntegerValue.mul_checked(a, b);
+    try std.testing.expectError(error.TypeMismatch, mul_result);
+
+    // Division by zero check still works
+    const same_tag_zero = vm_values.IntegerValue{ .U64 = 0 };
+    const div_result = vm_values.IntegerValue.div_checked(a, same_tag_zero);
+    try std.testing.expectError(error.DivisionByZero, div_result);
+
+    // Bit ops also reject mismatched tags
+    const bit_and_result = vm_values.IntegerValue.bit_and(a, b);
+    try std.testing.expectError(error.TypeMismatch, bit_and_result);
+
+    const bit_or_result = vm_values.IntegerValue.bit_or(a, b);
+    try std.testing.expectError(error.TypeMismatch, bit_or_result);
+
+    const bit_xor_result = vm_values.IntegerValue.bit_xor(a, b);
+    try std.testing.expectError(error.TypeMismatch, bit_xor_result);
+
+    const shl_result = vm_values.IntegerValue.shl_checked(a, b);
+    try std.testing.expectError(error.TypeMismatch, shl_result);
+
+    const shr_result = vm_values.IntegerValue.shr_checked(a, b);
+    try std.testing.expectError(error.TypeMismatch, shr_result);
+
+    // Comparison ops also reject mismatched tags
+    const lt_result = vm_values.IntegerValue.lt(a, b);
+    try std.testing.expectError(error.TypeMismatch, lt_result);
+
+    const gt_result = vm_values.IntegerValue.gt(a, b);
+    try std.testing.expectError(error.TypeMismatch, gt_result);
+
+    const le_result = vm_values.IntegerValue.le(a, b);
+    try std.testing.expectError(error.TypeMismatch, le_result);
+
+    const ge_result = vm_values.IntegerValue.ge(a, b);
+    try std.testing.expectError(error.TypeMismatch, ge_result);
+
+    // Same-tag operations still succeed
+    const same_tag = vm_values.IntegerValue{ .U64 = 5 };
+    const sum = try vm_values.IntegerValue.add_checked(a, same_tag);
+    try std.testing.expectEqual(@as(u64, 15), sum.U64);
 }

@@ -24,6 +24,8 @@ pub const Function = struct {
     struct_instantiations: []const module_mod.StructDefInstantiation = &.{},
     constants: []const module_mod.Constant = &.{},
     function_handles: []const module_mod.FunctionHandle = &.{},
+    resolved_handles: []const ?*Function = &.{},
+    resolved_struct_field_types: []const types.ResolvedStructFieldTypes = &.{},
 
     pub fn init(allocator: std.mem.Allocator, name: []const u8) Function {
         return .{
