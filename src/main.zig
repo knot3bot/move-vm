@@ -1,80 +1,118 @@
 const std = @import("std");
-const vm_mod = @import("vm/mod.zig");
-const gas_mod = @import("gas/gas.zig");
-const storage_mod = @import("storage/storage.zig");
-const session_mod = @import("vm/session.zig");
+const vm = @import("vm/mod.zig");
+const bytecode = vm.bytecode;
+const Instruction = bytecode.Instruction;
+const Function = vm.frame.Function;
+const Interpreter = vm.interpreter.Interpreter;
+const Gas = @import("gas/gas.zig").Gas;
+const Value = vm.values.Value;
+const DataStore = @import("storage/storage.zig").DataStore;
 
 pub fn main() !void {
-    // Initialize modules
-    vm_mod.init();
-    gas_mod.init();
-    storage_mod.init();
-
     std.debug.print("Move VM (Zig 0.16.0) - Core Implementation\n", .{});
     std.debug.print("=========================================\n\n", .{});
 
-    // Create allocator
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    // Create storage
-    var storage = storage_mod.Storage.init(allocator);
-    defer storage.deinit();
+    // Demo 1: Simple arithmetic (10 + 32 = 42)
+    std.debug.print("Demo 1: Simple Arithmetic (10 + 32)\n", .{});
+    std.debug.print("------------------------------------\n", .{});
 
-    // Create Move VM
-    var vm = session_mod.MoveVM.init(allocator);
-    defer vm.deinit();
+    var add_func = Function.init(allocator, "add");
+    defer add_func.deinit(allocator);
+    add_func.param_count = 2;
+    add_func.local_count = 3;
+    add_func.return_count = 1;
 
-    // Create session
-    var session = vm.newSession(&storage, 1000000);
-    defer session.deinit();
+    try add_func.code.push(allocator, Instruction{ .copy_loc = 0 });
+    try add_func.code.push(allocator, Instruction{ .copy_loc = 1 });
+    try add_func.code.push(allocator, Instruction{ .add = {} });
+    try add_func.code.push(allocator, Instruction{ .st_loc = 2 });
+    try add_func.code.push(allocator, Instruction{ .copy_loc = 2 });
+    try add_func.code.push(allocator, Instruction{ .ret = .{ .num_vals = 1 } });
 
-    std.debug.print("Components initialized:\n", .{});
-    std.debug.print("  - MoveVM: ✓\n", .{});
-    std.debug.print("  - Session: ✓\n", .{});
-    std.debug.print("  - Storage: ✓\n", .{});
-    std.debug.print("  - Gas Meter: ✓\n\n", .{});
+    var gas1 = Gas.init(10000);
+    var interp1 = Interpreter.init(allocator);
+    defer interp1.deinit(allocator);
 
-    // Test storage operations
-    std.debug.print("Storage Test:\n", .{});
-    std.debug.print("------------\n", .{});
+    const args1 = [_]Value{ Value.makeU64(10), Value.makeU64(32) };
+    const result1 = try interp1.executeFunction(allocator, &add_func, &.{}, &.{}, &args1, &gas1);
+    defer allocator.free(result1.values);
 
-    // Set a global value
-    const test_addr = "0x1";
-    const test_type = "TestResource";
-    try storage.setGlobal(test_addr, test_type, .{ .U64 = 123 });
+    std.debug.print("Result: {} (expected 42)\n", .{result1.values[0].impl.U64});
+    std.debug.print("Gas used: {}\n\n", .{result1.gas_used});
 
-    // Get the value
-    if (try storage.getGlobal(test_addr, test_type)) |val| {
-        std.debug.print("Stored and retrieved: {}\n", .{val.U64});
+    // Demo 2: Fibonacci(10) = 55
+    std.debug.print("Demo 2: Fibonacci(10)\n", .{});
+    std.debug.print("---------------------\n", .{});
+
+    var fib_func = Function.init(allocator, "fib");
+    defer fib_func.deinit(allocator);
+    fib_func.param_count = 1;
+    fib_func.local_count = 5;
+    fib_func.return_count = 1;
+
+    // locals: 0=n, 1=a, 2=b, 3=i, 4=temp
+    try fib_func.code.push(allocator, Instruction{ .ld_u64 = 0 });
+    try fib_func.code.push(allocator, Instruction{ .st_loc = 1 });
+    try fib_func.code.push(allocator, Instruction{ .ld_u64 = 1 });
+    try fib_func.code.push(allocator, Instruction{ .st_loc = 2 });
+    try fib_func.code.push(allocator, Instruction{ .ld_u64 = 0 });
+    try fib_func.code.push(allocator, Instruction{ .st_loc = 3 });
+
+    // loop start (pc=6)
+    try fib_func.code.push(allocator, Instruction{ .copy_loc = 3 });
+    try fib_func.code.push(allocator, Instruction{ .copy_loc = 0 });
+    try fib_func.code.push(allocator, Instruction{ .lt = {} });
+    try fib_func.code.push(allocator, Instruction{ .br_false = 23 });
+
+    try fib_func.code.push(allocator, Instruction{ .copy_loc = 1 });
+    try fib_func.code.push(allocator, Instruction{ .copy_loc = 2 });
+    try fib_func.code.push(allocator, Instruction{ .add = {} });
+    try fib_func.code.push(allocator, Instruction{ .st_loc = 4 });
+
+    try fib_func.code.push(allocator, Instruction{ .move_loc = 2 });
+    try fib_func.code.push(allocator, Instruction{ .st_loc = 1 });
+
+    try fib_func.code.push(allocator, Instruction{ .move_loc = 4 });
+    try fib_func.code.push(allocator, Instruction{ .st_loc = 2 });
+
+    try fib_func.code.push(allocator, Instruction{ .copy_loc = 3 });
+    try fib_func.code.push(allocator, Instruction{ .ld_u64 = 1 });
+    try fib_func.code.push(allocator, Instruction{ .add = {} });
+    try fib_func.code.push(allocator, Instruction{ .st_loc = 3 });
+
+    try fib_func.code.push(allocator, Instruction{ .branch = 6 });
+
+    try fib_func.code.push(allocator, Instruction{ .copy_loc = 1 });
+    try fib_func.code.push(allocator, Instruction{ .ret = .{ .num_vals = 1 } });
+
+    var gas2 = Gas.init(100000);
+    var interp2 = Interpreter.init(allocator);
+    defer interp2.deinit(allocator);
+
+    const args2 = [_]Value{Value.makeU64(10)};
+    const result2 = try interp2.executeFunction(allocator, &fib_func, &.{}, &.{}, &args2, &gas2);
+    defer allocator.free(result2.values);
+
+    std.debug.print("Result: {} (expected 55)\n", .{result2.values[0].impl.U64});
+    std.debug.print("Gas used: {}\n\n", .{result2.gas_used});
+
+    // Demo 3: Storage
+    std.debug.print("Demo 3: Storage Operations\n", .{});
+    std.debug.print("-------------------------\n", .{});
+
+    var store = DataStore.init(allocator);
+    defer store.deinit();
+
+    try store.setGlobal("0x1", "Coin", Value.makeU64(1000));
+    if (try store.getGlobal("0x1", "Coin")) |val| {
+        std.debug.print("Stored Coin value: {}\n", .{val.impl.U64});
     }
+    std.debug.print("Exists check: {}\n\n", .{store.exists("0x1", "Coin")});
 
-    // Check exists
-    if (storage.exists(test_addr, test_type)) {
-        std.debug.print("Exists check: true ✓\n", .{});
-    }
-
-    // Test gas
-    std.debug.print("\nGas Test:\n", .{});
-    std.debug.print("--------\n", .{});
-    var gas_track = gas_mod.Gas.init(1000);
-    try gas_track.consume(100);
-    std.debug.print("Gas consumed: 100, remaining: {} ✓\n", .{gas_track.getRemaining()});
-    std.debug.print("Gas used: {} ✓\n", .{gas_track.getUsed()});
-
-    // Test gas out of gas error
-    var empty_gas = gas_mod.Gas.init(50);
-    const result = empty_gas.consume(100);
-    if (result == error.OutOfGas) {
-        std.debug.print("OutOfGas error handling: ✓\n", .{});
-    }
-
-    // Test session gas
-    std.debug.print("\nSession Gas Test:\n", .{});
-    std.debug.print("-----------------\n", .{});
-    std.debug.print("Session initial gas: {} ✓\n", .{session.getRemainingGas()});
-
-    std.debug.print("\n=========================================\n", .{});
-    std.debug.print("All tests passed!\n", .{});
+    std.debug.print("=========================================\n", .{});
+    std.debug.print("All demos completed successfully!\n", .{});
 }

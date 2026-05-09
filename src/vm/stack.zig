@@ -1,90 +1,151 @@
 const std = @import("std");
-const frame = @import("frame.zig");
+const values = @import("values.zig");
+const Value = values.Value;
+const ValueImpl = values.ValueImpl;
 
-/// Operand stack for the Move VM
+/// Operand stack for the Move VM.
 pub const Stack = struct {
-    /// Stack values
-    data: std.ArrayList(frame.Value),
-    /// Maximum stack size (for safety checks)
+    values: std.ArrayList(Value),
     max_size: u32,
 
     const default_max_size = 1024;
 
-    /// Initialize a new stack
     pub fn init(allocator: std.mem.Allocator) Stack {
+        _ = allocator;
         return .{
-            .data = std.ArrayList(frame.Value).empty,
+            .values = std.ArrayList(Value).empty,
             .max_size = default_max_size,
         };
     }
 
-    /// Initialize with custom max size
     pub fn initMax(allocator: std.mem.Allocator, max_size: u32) Stack {
+        _ = allocator;
         return .{
-            .data = std.ArrayList(frame.Value).empty,
+            .values = std.ArrayList(Value).empty,
             .max_size = max_size,
         };
     }
 
-    /// Get current stack size
     pub fn len(self: Stack) u32 {
-        return @intCast(self.data.items.len);
+        return @intCast(self.values.items.len);
     }
 
-    /// Check if stack is empty
     pub fn isEmpty(self: Stack) bool {
-        return self.data.items.len == 0;
+        return self.values.items.len == 0;
     }
 
-    /// Push a value onto the stack
-    pub fn push(self: *Stack, allocator: std.mem.Allocator, value: frame.Value) !void {
-        if (self.data.items.len >= self.max_size) {
+    pub fn push(self: *Stack, allocator: std.mem.Allocator, value: Value) !void {
+        if (self.values.items.len >= self.max_size) {
             return error.StackOverflow;
         }
-        try self.data.append(allocator, value);
+        try self.values.append(allocator, value);
     }
 
-    /// Pop a value from the stack
-    pub fn pop(self: *Stack) !frame.Value {
-        if (self.data.items.len == 0) {
+    pub fn pop(self: *Stack) !Value {
+        if (self.values.items.len == 0) {
             return error.StackUnderflow;
         }
-        return self.data.pop();
+        return self.values.pop().?;
     }
 
-    /// Peek at top value without removing
-    pub fn peek(self: Stack) !frame.Value {
-        if (self.data.items.len == 0) {
+    /// Pop a value and cast it to a specific type.
+    pub fn popAs(self: *Stack, comptime T: type) !T {
+        const val = try self.pop();
+        return switch (T) {
+            u8 => switch (val.impl) { .U8 => |x| x, else => error.TypeMismatch },
+            u16 => switch (val.impl) { .U16 => |x| x, else => error.TypeMismatch },
+            u32 => switch (val.impl) { .U32 => |x| x, else => error.TypeMismatch },
+            u64 => switch (val.impl) { .U64 => |x| x, else => error.TypeMismatch },
+            u128 => switch (val.impl) { .U128 => |x| x, else => error.TypeMismatch },
+            u256 => switch (val.impl) { .U256 => |x| x, else => error.TypeMismatch },
+            bool => switch (val.impl) { .Bool => |x| x, else => error.TypeMismatch },
+            Value => val,
+            else => error.TypeMismatch,
+        };
+    }
+
+    /// Pop n values from the stack, returning them in order (oldest first).
+    pub fn popn(self: *Stack, allocator: std.mem.Allocator, n: u16) ![]Value {
+        if (self.values.items.len < n) return error.StackUnderflow;
+        const start = self.values.items.len - n;
+        const result = try allocator.alloc(Value, n);
+        for (0..n) |i| {
+            result[i] = self.values.items[start + i];
+        }
+        self.values.shrinkRetainingCapacity(start);
+        return result;
+    }
+
+    /// Peek at the last n values without removing them.
+    pub fn last_n(self: Stack, n: usize) ![]const Value {
+        if (self.values.items.len < n) return error.StackUnderflow;
+        return self.values.items[self.values.items.len - n ..];
+    }
+
+    pub fn peek(self: Stack) !Value {
+        if (self.values.items.len == 0) {
             return error.StackUnderflow;
         }
-        return self.data.items[self.data.items.len - 1];
+        return self.values.items[self.values.items.len - 1];
     }
 
-    /// Peek at value at offset from top
-    pub fn peekOffset(self: Stack, offset: u32) !frame.Value {
-        const stack_len = self.data.items.len;
+    pub fn peekOffset(self: Stack, offset: u32) !Value {
+        const stack_len = self.values.items.len;
         if (offset >= stack_len) {
             return error.StackUnderflow;
         }
-        return self.data.items[stack_len - 1 - offset];
+        return self.values.items[stack_len - 1 - offset];
     }
 
-    /// Set value at offset from top
-    pub fn setOffset(self: *Stack, offset: u32, value: frame.Value) !void {
-        const stack_len = self.data.items.len;
-        if (offset >= stack_len) {
-            return error.StackUnderflow;
-        }
-        self.data.items[stack_len - 1 - offset] = value;
-    }
-
-    /// Clear the stack
     pub fn clear(self: *Stack) void {
-        self.data.clearRetainingCapacity();
+        self.values.clearRetainingCapacity();
     }
 
-    /// Deallocate
+    /// Clear the stack and deinitialize all values (for error cleanup).
+    pub fn clearAndDeinit(self: *Stack, allocator: std.mem.Allocator) void {
+        for (self.values.items) |*val| {
+            val.deinit(allocator);
+        }
+        self.values.clearRetainingCapacity();
+    }
+
     pub fn deinit(self: *Stack, allocator: std.mem.Allocator) void {
-        self.data.deinit(allocator);
+        for (self.values.items) |*val| {
+            val.deinit(allocator);
+        }
+        self.values.deinit(allocator);
     }
 };
+
+// ==================== Tests ====================
+
+test "Stack push and pop" {
+    const allocator = std.testing.allocator;
+    var stack = Stack.init(allocator);
+    defer stack.deinit(allocator);
+
+    try stack.push(allocator, Value.makeU64(1));
+    try stack.push(allocator, Value.makeU64(2));
+    try std.testing.expectEqual(@as(u32, 2), stack.len());
+
+    const b = try stack.popAs(u64);
+    try std.testing.expectEqual(@as(u64, 2), b);
+    const a = try stack.popAs(u64);
+    try std.testing.expectEqual(@as(u64, 1), a);
+}
+
+test "Stack popn" {
+    const allocator = std.testing.allocator;
+    var stack = Stack.init(allocator);
+    defer stack.deinit(allocator);
+
+    try stack.push(allocator, Value.makeU64(1));
+    try stack.push(allocator, Value.makeU64(2));
+    try stack.push(allocator, Value.makeU64(3));
+
+    const vals = try stack.popn(allocator, 2);
+    defer allocator.free(vals);
+    try std.testing.expectEqual(@as(u64, 2), vals[0].impl.U64);
+    try std.testing.expectEqual(@as(u64, 3), vals[1].impl.U64);
+    try std.testing.expectEqual(@as(u32, 1), stack.len());
+}

@@ -1,167 +1,210 @@
 const std = @import("std");
-const frame = @import("frame.zig");
+const values = @import("values.zig");
+const Value = values.Value;
 const bytecode = @import("bytecode.zig");
 const module_mod = @import("module.zig");
 const storage = @import("../storage/storage.zig");
 const gas = @import("../gas/gas.zig");
+const Gas = gas.Gas;
 const interpreter = @import("interpreter.zig");
+const types = @import("types.zig");
+const Function = @import("frame.zig").Function;
+const vm_loader = @import("loader.zig");
+const native_mod = @import("native.zig");
+const Event = native_mod.Event;
 
-/// VM Session - executes transactions
-/// Reference: move-language/move/language/move-vm/runtime/src/session.rs
 pub const Session = struct {
     allocator: std.mem.Allocator,
-    /// Storage interface
-    storage: *storage.Storage,
-    /// Module cache
+    storage: *storage.DataStore,
     module_cache: module_mod.ModuleCache,
-    /// Gas meter
-    gas_meter: gas.Gas,
-    /// Events emitted during execution (placeholder)
-    events: []const u8,
-    /// Return values from last execution (placeholder)
-    return_values: []frame.Value,
-    /// Whether session is valid
-    valid: bool,
+    loader: *vm_loader.Loader,
+    native_functions: *native_mod.NativeFunctions,
+    gas_meter: Gas,
+    events: std.ArrayList(Event),
+    config: VMConfig,
 
     const Self = @This();
 
-    /// Create a new session
-    pub fn init(allocator: std.mem.Allocator, store: *storage.Storage, initial_gas: u64) Self {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        store: *storage.DataStore,
+        loader: *vm_loader.Loader,
+        natives: *native_mod.NativeFunctions,
+        initial_gas: u64,
+        config: VMConfig,
+    ) Session {
         return .{
             .allocator = allocator,
             .storage = store,
             .module_cache = module_mod.ModuleCache.init(allocator),
-            .gas_meter = gas.Gas.init(initial_gas),
-            .events = &.{},
-            .return_values = &.{},
-            .valid = true,
+            .loader = loader,
+            .native_functions = natives,
+            .gas_meter = Gas.init(initial_gas),
+            .events = std.ArrayList(Event).empty,
+            .config = config,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.module_cache.deinit(self.allocator);
-        self.valid = false;
+        self.module_cache.deinit();
+        for (self.events.items) |*evt| {
+            self.allocator.free(evt.data);
+        }
+        self.events.deinit(self.allocator);
     }
 
-    /// Helper to get remaining gas
+    fn takeEvents(self: *Self) ![]Event {
+        const slice = try self.events.toOwnedSlice(self.allocator);
+        self.events = std.ArrayList(Event).empty;
+        return slice;
+    }
+
     pub fn getRemainingGas(self: Self) u64 {
         return self.gas_meter.getRemaining();
     }
 
-    /// Execute a Move script (entry point)
     pub fn executeScript(
         self: *Self,
-        script: *const module_mod.FunctionDef,
-        args: []frame.Value,
+        script: *const Function,
+        args: []Value,
     ) !ExecutionResult {
-        // Create interpreter
-        var interp = interpreter.Interpreter.init(
-            self.allocator,
-            self.gas_meter.getRemaining(),
-            self.storage,
-        );
-        defer interp.deinit();
+        var interp = interpreter.Interpreter.initWithConfig(self.allocator, self.config.max_stack_size, self.config.max_call_stack_depth, self.config.paranoid_type_checks);
+        defer interp.deinit(self.allocator);
+        interp.setStorage(self.storage);
+        interp.setNativeFunctions(self.native_functions);
+        interp.setEvents(&self.events);
 
-        // Execute the function
+        // Resolve module functions if script belongs to a loaded module
+        const module_funcs = if (script.module.len > 0) blk: {
+            const mod_id = types.ModuleId{
+                .address = [_]u8{0} ** 32,
+                .name = script.module,
+            };
+            break :blk (self.loader.getFunctions(mod_id) catch &.{}) orelse &.{};
+        } else &[0]Function{};
+
+        const inst_funcs = if (script.module.len > 0) blk: {
+            const mod_id = types.ModuleId{
+                .address = [_]u8{0} ** 32,
+                .name = script.module,
+            };
+            break :blk (self.loader.getInstantiatedFunctions(mod_id) catch &.{}) orelse &.{};
+        } else &[0]Function{};
+
+        const inst_ty_args = if (script.module.len > 0) blk: {
+            const mod_id = types.ModuleId{
+                .address = [_]u8{0} ** 32,
+                .name = script.module,
+            };
+            break :blk (self.loader.getInstantiatedFunctionTyArgs(mod_id) catch &.{}) orelse &.{};
+        } else &[0][]types.Type{};
+
+        interp.setInstantiatedFunctions(inst_funcs);
+        interp.setInstantiatedFunctionTyArgs(inst_ty_args);
+        interp.setLoader(self.loader);
+        interp.setLoader(self.loader);
+
+        // Begin transaction for atomic execution
+        try self.storage.beginTransaction();
+        errdefer self.storage.rollbackTransaction() catch {};
+
         const result = try interp.executeFunction(
-            &self.scriptToFunction(script),
+            self.allocator,
+            script,
+            module_funcs,
+            &.{},
             args,
+            &self.gas_meter,
         );
+        errdefer result.deinit(self.allocator);
 
-        // Copy return values
-        self.return_values.clearRetainingCapacity();
-        try self.return_values.appendSlice(result.values);
+        // Commit transaction on success
+        self.storage.commitTransaction();
 
         return .{
             .status = .Success,
-            .return_values = self.return_values.items,
-            .events = self.events.items,
+            .return_values = result.values,
+            .events = try self.takeEvents(),
             .gas_used = result.gas_used,
         };
     }
 
-    /// Execute a function in a module
     pub fn executeFunction(
         self: *Self,
-        module_id: *const module_mod.ModuleId,
+        module_id: types.ModuleId,
         function_name: []const u8,
-        type_args: []const frame.Type,
-        args: []frame.Value,
+        ty_args: []const types.Type,
+        args: []Value,
     ) !ExecutionResult {
-        _ = type_args; // Not yet implemented
-        // Find the module
-        const mod = self.module_cache.getModule(module_id) orelse {
-            return error.ModuleNotFound;
+        const func = (try self.loader.getFunctionByName(module_id, function_name)) orelse {
+            return .{
+                .status = .FunctionNotFound,
+                .return_values = &.{},
+                .events = &.{},
+                .gas_used = 0,
+            };
         };
 
-        // Find the function
-        const func = self.findFunction(mod, function_name) orelse {
-            return error.FunctionNotFound;
+        const all_funcs = (try self.loader.getFunctions(module_id)) orelse &.{};
+        const inst_funcs = (try self.loader.getInstantiatedFunctions(module_id)) orelse &.{};
+        const inst_ty_args = (try self.loader.getInstantiatedFunctionTyArgs(module_id)) orelse &.{};
+
+        var interp = interpreter.Interpreter.initWithConfig(self.allocator, self.config.max_stack_size, self.config.max_call_stack_depth, self.config.paranoid_type_checks);
+        defer interp.deinit(self.allocator);
+        interp.setStorage(self.storage);
+        interp.setNativeFunctions(self.native_functions);
+        interp.setEvents(&self.events);
+        interp.setInstantiatedFunctions(inst_funcs);
+        interp.setInstantiatedFunctionTyArgs(inst_ty_args);
+        interp.setLoader(self.loader);
+
+        try self.storage.beginTransaction();
+        errdefer self.storage.rollbackTransaction() catch {};
+
+        const result = try interp.executeFunction(
+            self.allocator,
+            func,
+            all_funcs,
+            ty_args,
+            args,
+            &self.gas_meter,
+        );
+        errdefer result.deinit(self.allocator);
+
+        self.storage.commitTransaction();
+
+        return .{
+            .status = .Success,
+            .return_values = result.values,
+            .events = try self.takeEvents(),
+            .gas_used = result.gas_used,
         };
-
-        return self.executeScript(&func, args);
     }
 
-    /// Publish a module to storage
-    pub fn publishModule(self: *Self, module: *module_mod.Module) !void {
-        // Validate module (basic checks)
-        try self.validateModule(module);
-
-        // Store in module cache
-        try self.module_cache.addModule(module);
-    }
-
-    /// Validate a module
-    fn validateModule(self: *Self, module: *module_mod.Module) !void {
-        _ = self;
-        // Basic validation - check struct abilities
-        for (module.struct_defs.items) |struct_def| {
-            // Resources must have key ability
-            for (struct_def.fields.items) |field| {
-                if (field.type_signature == .Signer and !struct_def.abilities.is_key) {
-                    return error.InvalidResource;
-                }
-            }
-        }
-    }
-
-    /// Find a function by name in a module
-    fn findFunction(self: *Self, module: *module_mod.Module, name: []const u8) ?module_mod.FunctionDef {
-        _ = self;
-        for (module.function_defs.items) |func_def| {
-            if (module.getFunction(func_def.handle)) |handle| {
-                if (std.mem.eql(u8, handle.name, name)) {
-                    return func_def;
-                }
-            }
-        }
-        return null;
-    }
-
-    /// Convert script FunctionDef to Function for interpreter
-    fn scriptToFunction(self: *Self, script: *const module_mod.FunctionDef) frame.Function {
-        var func = frame.Function.init(self.allocator, "script");
-        func.param_count = script.params;
-        func.return_count = script.returns;
-        func.local_count = script.params + script.returns;
-        func.is_native = script.is_native;
-        func.code = script.code;
-        return func;
+    pub fn publishModule(self: *Self, mod: *module_mod.Module) !void {
+        try self.module_cache.addModule(mod);
+        try self.loader.loadModule(mod);
     }
 };
 
-/// Execution result
 pub const ExecutionResult = struct {
     status: Status,
-    /// Return values from execution
-    return_values: []frame.Value,
-    /// Events emitted
+    return_values: []Value,
     events: []Event,
-    /// Gas used
     gas_used: u64,
+
+    pub fn deinit(self: ExecutionResult, allocator: std.mem.Allocator) void {
+        for (self.return_values) |*val| {
+            val.deinit(allocator);
+        }
+        allocator.free(self.return_values);
+        for (self.events) |*evt| {
+            allocator.free(evt.data);
+        }
+        allocator.free(self.events);
+    }
 };
 
-/// Execution status
 pub const Status = enum {
     Success,
     Aborted,
@@ -173,51 +216,40 @@ pub const Status = enum {
     InvalidResource,
 };
 
-/// Event emitted during execution
-pub const Event = struct {
-    /// Event type (0 = burn, 1 = mint, etc.)
-    type_id: u64,
-    /// Event data
-    data: []const u8,
-};
-
-/// Move VM - main entry point
-/// Reference: move-language/move/language/move-vm/runtime/src/move_vm.rs
 pub const MoveVM = struct {
     allocator: std.mem.Allocator,
-    /// VM config
     config: VMConfig,
+    loader: vm_loader.Loader,
+    natives: native_mod.NativeFunctions,
 
     const Self = @This();
 
-    /// Create a new Move VM
-    pub fn init(allocator: std.mem.Allocator) Self {
+    pub fn init(allocator: std.mem.Allocator) MoveVM {
         return .{
             .allocator = allocator,
             .config = VMConfig.default(),
+            .loader = vm_loader.Loader.init(allocator),
+            .natives = native_mod.NativeFunctions.init(allocator),
         };
     }
 
-    /// Create a new session
-    pub fn newSession(self: *Self, store: *storage.Storage, initial_gas: u64) Session {
-        return Session.init(self.allocator, store, initial_gas);
+    pub fn deinit(self: *Self) void {
+        self.loader.deinit();
+        self.natives.deinit();
     }
 
-    /// Deinitialize
-    pub fn deinit(self: *Self) void {
-        _ = self;
+    pub fn newSession(self: *Self, store: *storage.DataStore, initial_gas: u64) Session {
+        return Session.init(self.allocator, store, &self.loader, &self.natives, initial_gas, self.config);
+    }
+
+    pub fn registerNative(self: *Self, module: []const u8, name: []const u8, func: native_mod.NativeFunc) !u16 {
+        return self.natives.register(module, name, func);
     }
 };
 
-/// VM Configuration
 pub const VMConfig = struct {
-    /// Gas schedule (use default)
-    use_native_gas_schedule: bool = true,
-    /// Maximum stack size
     max_stack_size: u32 = 1024,
-    /// Maximum call stack depth
     max_call_stack_depth: u32 = 1024,
-    /// Enable paranoid type checks (debug)
     paranoid_type_checks: bool = false,
 
     pub fn default() VMConfig {

@@ -2,7 +2,7 @@ const std = @import("std");
 
 /// Move VM Bytecode Instructions
 /// Reference: move-language/move/language/move-binary-format/src/file_format.rs
-/// A bytecode instruction
+
 pub const Instruction = union(enum) {
     // Stack operations
     pop: void,
@@ -11,7 +11,20 @@ pub const Instruction = union(enum) {
     // Local operations
     ld_loc: u8,
     st_loc: u8,
+    copy_loc: u8,
+    move_loc: u8,
+
+    // Constant loading
+    ld_u8: u8,
+    ld_u16: u16,
+    ld_u32: u32,
+    ld_u64: u64,
+    ld_u128: u128,
+    ld_u256: u256,
     ld_const: LdConst,
+    ld_addr: LdAddr,
+    ld_true: void,
+    ld_false: void,
 
     // Arithmetic
     add: void,
@@ -24,6 +37,11 @@ pub const Instruction = union(enum) {
     bit_xor: void,
     shl: void,
     shr: void,
+
+    // Logical
+    and_: void,
+    or_: void,
+    not: void,
 
     // Comparison
     lt: void,
@@ -41,14 +59,29 @@ pub const Instruction = union(enum) {
     call_generic: CallGeneric,
 
     // Pack/Unpack
-    pack: u8,
-    unpack: u8,
+    pack: u16,
+    unpack: u16,
+    pack_generic: u16,
+    unpack_generic: u16,
 
     // Reference operations
+    mut_borrow_loc: u8,
+    imm_borrow_loc: u8,
+    mut_borrow_field: u16,
+    imm_borrow_field: u16,
+    mut_borrow_field_generic: u16,
+    imm_borrow_field_generic: u16,
     read_ref: void,
     write_ref: void,
-    copy_loc: u8,
-    move_loc: u8,
+    freeze_ref: void,
+
+    // Cast operations
+    cast_u8: void,
+    cast_u16: void,
+    cast_u32: void,
+    cast_u64: void,
+    cast_u128: void,
+    cast_u256: void,
 
     // Global operations
     move_to: MoveTo,
@@ -57,177 +90,111 @@ pub const Instruction = union(enum) {
     move_to_generic: MoveToGeneric,
     move_from_generic: MoveFromGeneric,
     exists_generic: ExistsGeneric,
+    mut_borrow_global: BorrowGlobal,
+    imm_borrow_global: BorrowGlobal,
+    mut_borrow_global_generic: BorrowGlobalGeneric,
+    imm_borrow_global_generic: BorrowGlobalGeneric,
 
-    // Borrow global
-    borrow_global: BorrowGlobal,
-    borrow_global_generic: BorrowGlobalGeneric,
-
-    // Cast operations
-    cast: Type,
+    // Vector operations
+    vec_pack: VecPack,
+    vec_len: u16,
+    vec_imm_borrow: u16,
+    vec_mut_borrow: u16,
+    vec_push_back: u16,
+    vec_pop_back: u16,
+    vec_unpack: VecUnpack,
+    vec_swap: u16,
 
     // Abort
     abort: void,
 
     // Nop
     nop: void,
-
-    // New annotations
-    freeze_ref: void,
-
-    /// Simple instruction with no immediate
-    pub fn simple(op: SimpleOpcode) Instruction {
-        return switch (op) {
-            .Add => .add,
-            .Sub => .sub,
-            .Mul => .mul,
-            .Div => .div,
-            .Mod => .mod,
-            .BitAnd => .bit_and,
-            .BitOr => .bit_or,
-            .BitXor => .bit_xor,
-            .Shl => .shl,
-            .Shr => .shr,
-            .Lt => .lt,
-            .Gt => .gt,
-            .Le => .le,
-            .Ge => .ge,
-            .Eq => .eq,
-            .Neq => .neq,
-            .Pop => .pop,
-            .ReadRef => .read_ref,
-            .WriteRef => .write_ref,
-            .Abort => .abort,
-            .Nop => .nop,
-            .FreezeRef => .freeze_ref,
-        };
-    }
 };
 
-/// Simple opcodes (no immediate value)
-pub const SimpleOpcode = enum {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Mod,
-    BitAnd,
-    BitOr,
-    BitXor,
-    Shl,
-    Shr,
-    Lt,
-    Gt,
-    Le,
-    Ge,
-    Eq,
-    Neq,
-    Pop,
-    ReadRef,
-    WriteRef,
-    Abort,
-    Nop,
-    FreezeRef,
-};
-
-/// Return instruction
 pub const Ret = struct {
-    /// Number of return values
     num_vals: u8,
 };
 
-/// Load constant instruction
 pub const LdConst = struct {
-    /// Constant pool index
     const_idx: u32,
 };
 
-/// Call instruction
+pub const LdAddr = struct {
+    addr_idx: u16,
+};
+
 pub const Call = struct {
-    /// Function handle index
     func: u16,
 };
 
-/// Generic call instruction
 pub const CallGeneric = struct {
-    /// Function instantiation index
     func_instantiation: u16,
 };
 
-/// MoveTo instruction
 pub const MoveTo = struct {
-    /// Type signature index
     type_: u16,
 };
 
-/// MoveFrom instruction
 pub const MoveFrom = struct {
-    /// Type signature index
     type_: u16,
 };
 
-/// Exists instruction
 pub const Exists = struct {
-    /// Type signature index
     type_: u16,
 };
 
-/// Generic MoveTo
 pub const MoveToGeneric = struct {
-    /// Type instantiation index
     type_instantiation: u16,
 };
 
-/// Generic MoveFrom
 pub const MoveFromGeneric = struct {
-    /// Type instantiation index
     type_instantiation: u16,
 };
 
-/// Generic Exists
 pub const ExistsGeneric = struct {
-    /// Type instantiation index
     type_instantiation: u16,
 };
 
-/// Borrow global
 pub const BorrowGlobal = struct {
-    /// Type signature index
     type_: u16,
-    /// Mutable reference
-    mutable: bool,
 };
 
-/// Generic borrow global
 pub const BorrowGlobalGeneric = struct {
-    /// Type instantiation index
     type_instantiation: u16,
-    /// Mutable reference
-    mutable: bool,
 };
 
-/// Type for cast operation
-pub const Type = struct {
-    /// Type signature index
-    idx: u16,
+pub const VecPack = struct {
+    type_: u16,
+    num: u64,
+};
+
+pub const VecUnpack = struct {
+    type_: u16,
+    num: u64,
 };
 
 /// Bytecode sequence
 pub const Bytecode = struct {
-    /// Instructions
     instructions: std.ArrayList(Instruction),
 
     pub fn init(allocator: std.mem.Allocator) Bytecode {
+        _ = allocator;
         return .{
-            .instructions = std.ArrayList(Instruction).init(allocator),
+            .instructions = std.ArrayList(Instruction).empty,
         };
     }
 
-    pub fn deinit(self: *Bytecode) void {
-        self.instructions.deinit();
+    pub fn deinit(self: *Bytecode, allocator: std.mem.Allocator) void {
+        self.instructions.deinit(allocator);
     }
 
-    pub fn push(self: *Bytecode, inst: Instruction) !void {
-        try self.instructions.append(inst);
+    pub fn push(self: *Bytecode, allocator: std.mem.Allocator, inst: Instruction) !void {
+        try self.instructions.append(allocator, inst);
+    }
+
+    pub fn len(self: Bytecode) usize {
+        return self.instructions.items.len;
     }
 };
 
@@ -236,20 +203,36 @@ pub fn instructionGasCost(inst: Instruction) u64 {
     return switch (inst) {
         .add, .sub, .mul, .div, .mod => 1,
         .bit_and, .bit_or, .bit_xor, .shl, .shr => 1,
+        .and_, .or_, .not => 1,
         .lt, .gt, .le, .ge, .eq, .neq => 1,
         .pop, .ret => 1,
-        .ld_loc, .st_loc => 1,
+        .ld_loc, .st_loc, .copy_loc, .move_loc => 1,
+        .ld_u8, .ld_u16, .ld_u32, .ld_u64, .ld_u128, .ld_u256 => 1,
         .ld_const => 2,
+        .ld_addr => 2,
+        .ld_true, .ld_false => 1,
         .br_true, .br_false, .branch => 1,
         .call, .call_generic => 10,
         .pack, .unpack => 5,
+        .pack_generic, .unpack_generic => 10,
         .read_ref, .write_ref => 2,
-        .copy_loc, .move_loc => 1,
+        .mut_borrow_loc, .imm_borrow_loc => 1,
+        .mut_borrow_field, .imm_borrow_field => 2,
+        .mut_borrow_field_generic, .imm_borrow_field_generic => 4,
+        .freeze_ref => 0,
+        .cast_u8, .cast_u16, .cast_u32, .cast_u64, .cast_u128, .cast_u256 => 1,
         .move_to, .move_from, .exists => 5,
         .move_to_generic, .move_from_generic, .exists_generic => 10,
-        .borrow_global, .borrow_global_generic => 5,
-        .cast => 1,
+        .mut_borrow_global, .imm_borrow_global => 5,
+        .mut_borrow_global_generic, .imm_borrow_global_generic => 10,
         .abort => 1,
-        .nop, .freeze_ref => 0,
+        .nop => 0,
+        .vec_pack => 10,
+        .vec_len => 2,
+        .vec_imm_borrow, .vec_mut_borrow => 2,
+        .vec_push_back => 3,
+        .vec_pop_back => 2,
+        .vec_unpack => 5,
+        .vec_swap => 2,
     };
 }

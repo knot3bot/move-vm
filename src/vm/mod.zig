@@ -1,13 +1,12 @@
-pub const opcodes = @import("opcodes.zig");
+pub const bytecode = @import("bytecode.zig");
+pub const values = @import("values.zig");
+pub const locals = @import("locals.zig");
+pub const types = @import("types.zig");
 pub const frame = @import("frame.zig");
 pub const stack = @import("stack.zig");
-
-var initialized = false;
-
-pub fn isInitialized() bool {
-    return initialized;
-}
-
-pub fn init() void {
-    initialized = true;
-}
+pub const interpreter = @import("interpreter.zig");
+pub const module = @import("module.zig");
+pub const session = @import("session.zig");
+pub const native = @import("native.zig");
+pub const verifier = @import("verifier.zig");
+pub const loader = @import("loader.zig");

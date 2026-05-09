@@ -28,27 +28,19 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the move-vm");
     run_step.dependOn(&run_cmd.step);
 
-    // Test module includes all source files
+    // Tests
     const test_module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("src/tests.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{
-            .{
-                .name = "test_module",
-                .module = b.createModule(.{
-                    .root_source_file = b.path("src/main_test.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                }),
-            },
-        },
     });
 
     const test_compile_step = b.addTest(.{
         .root_module = test_module,
     });
 
+    const run_test = b.addRunArtifact(test_compile_step);
+
     const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&test_compile_step.step);
+    test_step.dependOn(&run_test.step);
 }
