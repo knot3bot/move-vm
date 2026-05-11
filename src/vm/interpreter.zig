@@ -76,6 +76,15 @@ pub const VMError = error{
 const storage_mod = @import("../storage/storage.zig");
 const native_mod = @import("native.zig");
 
+/// Compute a stable verification key from function identity.
+/// Replaces bare pointer hashing to avoid false cache hits after module reload.
+fn computeVerificationKey(func: *const Function) u64 {
+    var key = std.hash.Wyhash.hash(0, &func.module_address);
+    key = std.hash.Wyhash.hash(key, func.module);
+    key = std.hash.Wyhash.hash(key, func.name);
+    return key;
+}
+
 pub const Interpreter = struct {
     operand_stack: Stack,
     call_stack: std.ArrayList(Frame),
@@ -88,7 +97,7 @@ pub const Interpreter = struct {
     events: ?*std.ArrayList(native_mod.Event),
     loader: ?*vm_loader.Loader,
     last_abort_code: u64,
-    verified_set: std.AutoHashMap(usize, void),
+    verified_set: std.AutoHashMap(u64, void),
 
     const Self = @This();
     const DEFAULT_MAX_CALL_DEPTH: u32 = 256;
@@ -100,7 +109,7 @@ pub const Interpreter = struct {
 
     pub fn initWithConfig(allocator: std.mem.Allocator, max_stack_size: u32, max_call_depth: u32, paranoid_type_checks: bool) Self {
         return .{
-            .operand_stack = Stack.initMax(allocator, max_stack_size),
+            .operand_stack = Stack.initMax(allocator, max_stack_size) catch unreachable,
             .call_stack = std.ArrayList(Frame).empty,
             .paranoid_type_checks = paranoid_type_checks,
             .storage = null,
@@ -111,7 +120,7 @@ pub const Interpreter = struct {
             .events = null,
             .loader = null,
             .last_abort_code = 0,
-            .verified_set = std.AutoHashMap(usize, void).init(allocator),
+            .verified_set = std.AutoHashMap(u64, void).init(allocator),
         };
     }
 
@@ -230,14 +239,13 @@ pub const Interpreter = struct {
             allocator.free(native_result.values);
             return error.Aborted;
         }
-        const results = try allocator.dupe(Value, native_result.values);
-        allocator.free(native_result.values);
+        const results = native_result.values;
         return results;
     }
 
     /// Charge additional gas for data-size-dependent operations.
-    fn chargeDataSizeGas(self: *Self, inst: bytecode.Instruction, gas_meter: *Gas) VMError!void {
-        switch (inst) {
+    fn chargeDataSizeGas(self: *Self, inst: *const bytecode.Instruction, gas_meter: *Gas) VMError!void {
+        switch (inst.*) {
             .eq, .neq => {
                 if (self.operand_stack.values.items.len >= 2) {
                     const rhs = self.operand_stack.values.items[self.operand_stack.values.items.len - 1];
@@ -307,8 +315,8 @@ pub const Interpreter = struct {
         gas_meter: *Gas,
     ) VMError!ExecutionResult {
         // Mandatory bytecode verification before execution (cached to avoid repeated gas consumption)
-        const func_ptr = @intFromPtr(func);
-        if (!self.verified_set.contains(func_ptr)) {
+        const vkey = computeVerificationKey(func);
+        if (!self.verified_set.contains(vkey)) {
             vm_verifier.verifyFunction(allocator, func, functions, self.instantiated_functions, self.operand_stack.max_size) catch |verr| {
                 return switch (verr) {
                     error.StackUnderflow => error.StackUnderflow,
@@ -324,7 +332,7 @@ pub const Interpreter = struct {
                     error.OutOfMemory => error.OutOfMemory,
                 };
             };
-            try self.verified_set.put(func_ptr, {});
+            try self.verified_set.put(vkey, {});
         }
 
         // Handle native entry functions directly
@@ -345,9 +353,7 @@ pub const Interpreter = struct {
             }
 
             const results = try self.executeNative(allocator, native_func, ty_args, native_args, gas_meter);
-            defer allocator.free(results);
-            const out = try allocator.dupe(Value, results);
-            return .{ .values = out, .gas_used = gas_meter.getUsed() };
+            return .{ .values = results, .gas_used = gas_meter.getUsed() };
         }
 
         // Validate argument count
@@ -572,7 +578,7 @@ pub const Interpreter = struct {
     fn executeCode(self: *Self, allocator: std.mem.Allocator, frame: *Frame, gas_meter: *Gas) VMError!ExitCode {
         const code = &frame.function.code.instructions;
         while (frame.pc < code.items.len) {
-            const inst = code.items[frame.pc];
+            const inst = &code.items[frame.pc];
             try gas_meter.consume(instructionGasCost(inst));
             try self.chargeDataSizeGas(inst, gas_meter);
 
@@ -587,8 +593,8 @@ pub const Interpreter = struct {
     }
 
     /// Execute a single instruction.
-    fn executeInstruction(self: *Self, allocator: std.mem.Allocator, frame: *Frame, inst: bytecode.Instruction) VMError!InstrRet {
-        switch (inst) {
+    fn executeInstruction(self: *Self, allocator: std.mem.Allocator, frame: *Frame, inst: *const bytecode.Instruction) VMError!InstrRet {
+        switch (inst.*) {
             // Stack operations
             .pop => {
                 var val = try self.operand_stack.pop();
@@ -1093,7 +1099,7 @@ pub const Interpreter = struct {
                     .Container => |c| c,
                     else => return error.TypeMismatch,
                 };
-                container.ref_count += 1;
+                container.addRef();
                 const addr_copy = try allocator.dupe(u8, addr_key);
                 errdefer allocator.free(addr_copy);
                 const type_copy = try allocator.dupe(u8, type_key);
@@ -1125,7 +1131,7 @@ pub const Interpreter = struct {
                     .Container => |c| c,
                     else => return error.TypeMismatch,
                 };
-                container.ref_count += 1;
+                container.addRef();
                 const addr_copy = try allocator.dupe(u8, addr_key);
                 errdefer allocator.free(addr_copy);
                 const type_copy = try allocator.dupe(u8, type_key);
@@ -1211,7 +1217,7 @@ pub const Interpreter = struct {
                     .Container => |c| c,
                     else => return error.TypeMismatch,
                 };
-                container.ref_count += 1;
+                container.addRef();
                 try self.operand_stack.push(allocator, Value.init(.{ .ContainerRef = .{
                     .container = container,
                     .is_mutable = true,
@@ -1237,7 +1243,7 @@ pub const Interpreter = struct {
                     .Container => |c| c,
                     else => return error.TypeMismatch,
                 };
-                container.ref_count += 1;
+                container.addRef();
                 try self.operand_stack.push(allocator, Value.init(.{ .ContainerRef = .{
                     .container = container,
                     .is_mutable = false,
@@ -1274,6 +1280,6 @@ pub const Interpreter = struct {
     }
 };
 
-fn instructionGasCost(inst: bytecode.Instruction) u64 {
+fn instructionGasCost(inst: *const bytecode.Instruction) u64 {
     return bytecode.instructionGasCost(inst);
 }

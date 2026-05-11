@@ -199,8 +199,8 @@ pub const Bytecode = struct {
 };
 
 /// Gas cost per instruction
-pub fn instructionGasCost(inst: Instruction) u64 {
-    return switch (inst) {
+pub fn instructionGasCost(inst: *const Instruction) u64 {
+    return switch (inst.*) {
         .add, .sub, .mul, .div, .mod => 1,
         .bit_and, .bit_or, .bit_xor, .shl, .shr => 1,
         .and_, .or_, .not => 1,

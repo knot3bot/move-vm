@@ -121,6 +121,12 @@ pub const DataStore = struct {
     pub fn logChange(self: *DataStore, address: []const u8, type_key: []const u8) !void {
         if (self.change_logs.items.len == 0) return;
         const log = self.change_logs.items[self.change_logs.items.len - 1];
+        // If this key is already logged in the current transaction, skip the redundant deep-copy.
+        for (log.items) |entry| {
+            if (std.mem.eql(u8, entry.address, address) and std.mem.eql(u8, entry.type_key, type_key)) {
+                return;
+            }
+        }
         const addr_copy = try self.allocator.dupe(u8, address);
         errdefer self.allocator.free(addr_copy);
         const type_copy = try self.allocator.dupe(u8, type_key);
@@ -403,7 +409,7 @@ test "DataStore rollback restores global after IndexedRef write_ref" {
     try store.logChange("0x1", "MyStruct");
 
     // Create IndexedRef to field 0
-    global_container.ref_count += 1;
+    global_container.addRef();
     const addr_copy = try allocator.dupe(u8, "0x1");
     errdefer allocator.free(addr_copy);
     const tk_copy = try allocator.dupe(u8, "MyStruct");

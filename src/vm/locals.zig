@@ -66,7 +66,7 @@ pub const Locals = struct {
         switch (v) {
             .Invalid => return error.InvalidLocal,
             .Container => |c| {
-                c.ref_count += 1;
+                c.addRef();
                 return Value.init(.{ .ContainerRef = .{
                     .container = c,
                     .is_mutable = is_mutable,
@@ -75,7 +75,7 @@ pub const Locals = struct {
                 } });
             },
             else => {
-                self.container.ref_count += 1;
+                self.container.addRef();
                 return Value.init(.{ .IndexedRef = .{
                     .container_ref = .{
                         .container = self.container,

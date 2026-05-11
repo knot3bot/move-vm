@@ -18,10 +18,11 @@ pub const Stack = struct {
         };
     }
 
-    pub fn initMax(allocator: std.mem.Allocator, max_size: u32) Stack {
-        _ = allocator;
+    pub fn initMax(allocator: std.mem.Allocator, max_size: u32) !Stack {
+        var list = std.ArrayList(Value).empty;
+        try list.ensureTotalCapacity(allocator, max_size);
         return .{
-            .values = std.ArrayList(Value).empty,
+            .values = list,
             .max_size = max_size,
         };
     }
@@ -68,13 +69,9 @@ pub const Stack = struct {
     pub fn popn(self: *Stack, allocator: std.mem.Allocator, n: u16) ![]Value {
         if (self.values.items.len < n) return error.StackUnderflow;
         const start = self.values.items.len - n;
-        const result = try allocator.alloc(Value, n);
-        for (0..n) |i| {
-            result[i] = self.values.items[start + i];
-        }
-        // Deinitialize the original stack slots before shrinking
+        const result = try allocator.dupe(Value, self.values.items[start..]);
         for (self.values.items[start..]) |*val| {
-            val.deinit(allocator);
+            val.* = Value.invalid();
         }
         self.values.shrinkRetainingCapacity(start);
         return result;

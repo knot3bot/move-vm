@@ -44,6 +44,12 @@ pub const Container = struct {
         return ptr;
     }
 
+    /// Increment the reference count, panicking on overflow.
+    pub fn addRef(self: *Container) void {
+        if (self.ref_count == std.math.maxInt(u32)) @panic("ref_count overflow");
+        self.ref_count += 1;
+    }
+
     /// Deep-copy this container.
     pub fn copy_value(self: *Container, allocator: std.mem.Allocator) error{OutOfMemory}!*Container {
         const ptr = try allocator.create(Container);
@@ -74,10 +80,16 @@ pub const Container = struct {
 
     /// Compare two containers for equality.
     pub fn equals(self: *Container, other: *Container) !bool {
+        return equalsDepth(self, other, 0);
+    }
+
+    fn equalsDepth(self: *Container, other: *Container, depth: u16) !bool {
+        const MAX_DEPTH = 64;
+        if (depth > MAX_DEPTH) return error.TypeMismatch;
         if (self.kind != other.kind) return false;
         if (self.data.items.len != other.data.items.len) return false;
         for (self.data.items, other.data.items) |a, b| {
-            if (!try a.equals(b)) return false;
+            if (!try a.equalsDepth(b, depth + 1)) return false;
         }
         return true;
     }
@@ -137,7 +149,7 @@ pub const ValueImpl = union(enum) {
             .Address => |x| .{ .Address = x },
             .Container => |c| .{ .Container = try c.copy_value(allocator) },
             .ContainerRef => |r| {
-                r.container.ref_count += 1;
+                r.container.addRef();
                 const addr_copy = if (r.global_address) |addr| try allocator.dupe(u8, addr) else null;
                 errdefer if (addr_copy) |a| allocator.free(a);
                 const tk_copy = if (r.global_type_key) |tk| try allocator.dupe(u8, tk) else null;
@@ -151,7 +163,7 @@ pub const ValueImpl = union(enum) {
                 } };
             },
             .IndexedRef => |r| {
-                r.container_ref.container.ref_count += 1;
+                r.container_ref.container.addRef();
                 return .{ .IndexedRef = .{
                     .container_ref = .{
                         .container = r.container_ref.container,
@@ -169,6 +181,12 @@ pub const ValueImpl = union(enum) {
 
     /// Compare two ValueImpls for equality.
     pub fn equals(self: ValueImpl, other: ValueImpl) EqualsError!bool {
+        return equalsDepth(self, other, 0);
+    }
+
+    fn equalsDepth(self: ValueImpl, other: ValueImpl, depth: u16) EqualsError!bool {
+        const MAX_DEPTH = 64;
+        if (depth > MAX_DEPTH) return error.TypeMismatch;
         const tag_a = std.meta.activeTag(self);
         const tag_b = std.meta.activeTag(other);
         if (tag_a != tag_b) return false;
@@ -183,7 +201,7 @@ pub const ValueImpl = union(enum) {
             .U256 => |a| a == other.U256,
             .Bool => |a| a == other.Bool,
             .Address => |a| std.mem.eql(u8, &a, &other.Address),
-            .Container => |a| try a.equals(other.Container),
+            .Container => |a| try a.equalsDepth(other.Container, depth + 1),
             .ContainerRef => |a| a.container == other.ContainerRef.container,
             .IndexedRef => |a| a.container_ref.container == other.IndexedRef.container_ref.container and a.idx == other.IndexedRef.idx,
         };
@@ -270,7 +288,7 @@ pub const ValueImpl = union(enum) {
                 const item = r.container.data.items[idx];
                 switch (item) {
                     .Container => |c| {
-                        c.ref_count += 1;
+                        c.addRef();
                         return .{ .ContainerRef = .{
                             .container = c,
                             .is_mutable = r.is_mutable,
@@ -279,7 +297,7 @@ pub const ValueImpl = union(enum) {
                         } };
                     },
                     else => {
-                        r.container.ref_count += 1;
+                        r.container.addRef();
                         return .{ .IndexedRef = .{
                             .container_ref = r,
                             .idx = idx,
@@ -745,6 +763,7 @@ pub const StructValue = struct {
     pub fn pack(allocator: std.mem.Allocator, fields: []const Value, abilities: types.AbilitySet) !Value {
         const container = try Container.newWithAbilities(allocator, .Struct, abilities);
         errdefer container.deinit(allocator);
+        try container.data.ensureTotalCapacity(allocator, fields.len);
         for (fields) |field| {
             try container.data.append(allocator, (try field.copy_value(allocator)).impl);
         }
@@ -771,6 +790,7 @@ pub const VectorValue = struct {
     pub fn pack(allocator: std.mem.Allocator, elements: []const Value, abilities: types.AbilitySet) !Value {
         var container = try Container.newWithAbilities(allocator, .Vec, abilities);
         errdefer container.deinit(allocator);
+        try container.data.ensureTotalCapacity(allocator, elements.len);
         for (elements) |elem| {
             try container.data.append(allocator, (try elem.copy_value(allocator)).impl);
         }
